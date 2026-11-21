@@ -28,9 +28,7 @@ DECORATOR_RE = re.compile(r"^\s*@")
 IMPORT_RE = re.compile(r"^\s*(?:from\s+\S+\s+import|import\s+)")
 GLOBAL_RE = re.compile(r"^\s*(?:global|nonlocal)\s+")
 COMMENT_RE = re.compile(r"^\s*#")
-BRANCH_RE = re.compile(
-    r"^\s*(?:if|elif|else|while|for|match|case|except|try|finally|with)\b"
-)
+BRANCH_CONT_RE = re.compile(r"^\s*(?:and|or)\b")
 
 COST_PER_WORKER = 2000
 MEMORY_TEST_SUFFIX = "::test_generator_memory"
@@ -71,6 +69,9 @@ CORE_DYNAMIC_FILES = {
 }
 HEAVY_EXEMPT_PREFIXES = ("sqlglot/executor/", "sqlglot/optimizer/")
 HEAVY_EXEMPT_FILES = {"sqlglot/planner.py"}
+FAMILY_HEAVY_FILES = {OPTIMIZER_FILE, LINEAGE_FILE, EXECUTOR_FILE}
+CLASS_HEAVY_MS = 1500
+CLASS_TRIAGE_FILES = FAMILY_HEAVY_FILES
 
 
 def load_tests(tests_path: Path) -> list[tuple[int, str, str, int]]:
@@ -105,7 +106,10 @@ class Change:
 
 
 class PatchFile:
-    __slots__ = ("old_path", "new_path", "is_new", "is_deleted", "changes", "trivial_only")
+    __slots__ = (
+        "old_path", "new_path", "is_new", "is_deleted", "changes", "trivial_only",
+        "swapped", "replaced",
+    )
 
     def __init__(self) -> None:
         self.old_path: str | None = None
@@ -114,6 +118,8 @@ class PatchFile:
         self.is_deleted = False
         self.changes: list[Change] = []
         self.trivial_only = True
+        self.swapped = False
+        self.replaced: set[int] = set()
 
 
 def _norm_path(raw: str) -> str | None:
@@ -133,6 +139,26 @@ def _comment(text: str) -> bool:
     return bool(COMMENT_RE.match(text))
 
 
+SAFE_IS_RE = re.compile(
+    r"\bis\s+(?:not\s+)?(?:None\b|[A-Z]\w*\.[A-Z][A-Z0-9_]*\b)"
+)
+GENERATOR_RE = re.compile(r"\b(?:yield|await)\b")
+
+
+def _equiv_swap(minus: list[tuple[int, str]], plus: list[tuple[int, str]]) -> bool:
+    # Only `X is None` / `X is Enum.MEMBER` -> `==` swaps are no-ops here:
+    # identity and equality agree for None and Enum members, while arbitrary
+    # `is` -> `==` rewrites can change behaviour for other objects.
+    if not minus or len(minus) != len(plus):
+        return False
+    for (_, m), (_, p) in zip(minus, plus):
+        if not SAFE_IS_RE.search(m):
+            return False
+        if m.replace(" is not ", " != ").replace(" is ", " == ") != p:
+            return False
+    return True
+
+
 def parse_patch(text: str) -> tuple[list[PatchFile], bool]:
     files: list[PatchFile] = []
     cur: PatchFile | None = None
@@ -148,6 +174,15 @@ def parse_patch(text: str) -> tuple[list[PatchFile], bool]:
         if cur is None:
             minus, plus, block_anchor = [], [], None
             return
+        if _equiv_swap(minus, plus):
+            cur.swapped = True
+            minus, plus, block_anchor = [], [], None
+            return
+        if minus and plus and len(minus) == len(plus):
+            for pos, _ in minus:
+                cur.replaced.add(pos)
+            for pos, _ in plus:
+                cur.replaced.add(pos)
         for pos, line_text in minus:
             cur.changes.append(Change(pos, line_text))
         for pos, line_text in plus:
@@ -347,6 +382,7 @@ def select_tests(
     memory_tids = prep["memory_tids"]
     serialization_prefixes = prep["serialization_prefixes"]
     all_ms = {tid: ms for tid, _, _, ms in all_tests}
+    tid_file = {int(tid): nodeid.split("::")[0] for tid, nodeid in prep["nodeids"].items()}
     fast_executor = {
         tid for tid in sorted(
             file_to_tests.get(EXECUTOR_FILE, ()),
@@ -361,10 +397,22 @@ def select_tests(
     )
 
     chosen: set[int] = set()
+    silent_total = 0
+    active_total = 0
     use_all = not had
 
     def map_ms(tid: int) -> int:
         return all_ms.get(tid, 0)
+
+    def triage_class_level(ids) -> set[int]:
+        # A class-body line is "covered" by every test that imported the
+        # module, not by tests that use the constant. Expensive optimizer /
+        # executor / lineage suites that merely imported it are dropped; cheap
+        # tests stay so a genuinely affected one is still exercised.
+        return {
+            tid for tid in ids
+            if tid_file.get(tid) not in CLASS_TRIAGE_FILES or map_ms(tid) < CLASS_HEAVY_MS
+        }
 
     def heavy_exempt(rel: str) -> bool:
         return rel.startswith(HEAVY_EXEMPT_PREFIXES) or rel in HEAVY_EXEMPT_FILES
@@ -443,10 +491,13 @@ def select_tests(
             if test_file == EXECUTOR_FILE or test_file.startswith("tests/dataframe/"):
                 chosen.update(narrow_extension(ids & tids, rel))
 
-    def add_dialect_family(rel: str) -> None:
+    def add_dialect_family(rel: str, dense: bool = False) -> None:
         for stem in dialects.get(rel, ()):
-            chosen.update(dialect_tests.get(stem, ()))
-            chosen.update(fixture_dialect_tests.get(stem, ()))
+            ids = set(dialect_tests.get(stem, ()))
+            ids |= set(fixture_dialect_tests.get(stem, ()))
+            if dense:
+                ids = {tid for tid in ids if tid_file.get(tid) not in FAMILY_HEAVY_FILES}
+            chosen.update(ids)
 
     def span_keys_at(rel: str, pos: int) -> set[str]:
         out: set[str] = set()
@@ -515,7 +566,7 @@ def select_tests(
                 out |= _line_tids(rel, pos + delta, line_runs, groups)
         return out
 
-    def handle_position(rel: str, pos: int, text: str) -> None:
+    def handle_position(rel: str, pos: int, text: str, repl: bool = False) -> None:
         if _blank(text):
             return
         if _comment(text):
@@ -532,21 +583,41 @@ def select_tests(
         in_scope = _span_index(scope_groups.get(rel, []), pos)
 
         if in_scope is not None:
-            branch = bool(BRANCH_RE.match(text)) or bool(GLOBAL_RE.match(text))
             raw_line_ids = _line_tids(rel, pos, line_runs, groups)
-            if structural or branch or not raw_line_ids:
-                # A signature/branch edit, or a line with no baseline
-                # coverage (e.g. a new branch), can change every path through
-                # the function, so the full scope is required.
+            if (
+                repl
+                and not structural
+                and not raw_line_ids
+                and not BRANCH_CONT_RE.match(text)
+                and not GENERATOR_RE.search(text)
+            ):
+                # Replacing a statement that no baseline test ever executed is
+                # unobservable: reaching it depends on unchanged control flow,
+                # so no test can observe the new behaviour.
+                nonlocal silent_total
+                silent_total += 1
+                return
+            # A covered statement can only affect tests that executed it, even
+            # when the edited line is a branch header. Continuation lines
+            # (`and`/`or`) are the exception: a test may have short-circuited
+            # before reaching them at baseline yet change behaviour after the
+            # edit, so those keep the full function scope.
+            line_only = (
+                not structural
+                and bool(raw_line_ids)
+                and not BRANCH_CONT_RE.match(text)
+            )
+            if not line_only:
                 chosen.update(groups[in_scope[2]])
                 if structural:
                     chosen.update(class_consumer_tids(rel, pos, unlimited=True))
             else:
-                # Covered, non-branch line inside a function: the changed
-                # statement only runs in the tests that executed it.
                 chosen.update(line_tids_near(rel, pos))
             if is_dialect_module(rel):
-                add_dialect_family(rel)
+                dense = line_only and rel.startswith(
+                    ("sqlglot/parsers/", "sqlglot/generators/")
+                )
+                add_dialect_family(rel, dense=dense)
             return
 
         if _in_spans(doc_spans.get(rel, ()), pos):
@@ -575,7 +646,7 @@ def select_tests(
             # that imported the module (the class body runs on import).
             raw_line_ids = _line_tids(rel, pos, line_runs, groups)
             if raw_line_ids:
-                chosen.update(raw_line_ids)
+                chosen.update(triage_class_level(raw_line_ids))
                 return
             add_dialect_family(rel)
             if line_tids and len(line_tids) <= SMALL_ANCHOR_LIMIT:
@@ -646,11 +717,10 @@ def select_tests(
             chosen.update(narrow_extension(scoped_dialect, rel))
         elif class_level:
             add_test_file(DIALECT_TEST_FILE)
-        scoped_opt = module_ids & file_to_tests.get(OPTIMIZER_FILE, set())
-        if scoped_opt:
-            chosen.update(narrow_extension(scoped_opt, rel))
-        add_test_file(LINEAGE_FILE)
-        add_dialect_family(rel)
+        # A class-level constant is only observed by the tests that execute it;
+        # the optimizer, lineage and executor suites are not static consumers
+        # and would add tens of seconds of unrelated runtime.
+        add_dialect_family(rel, dense=True)
 
     def handle_missing_file(rel: str) -> None:
         stem = Path(rel).stem
@@ -712,10 +782,15 @@ def select_tests(
                     matched = True
         return matched
 
+    swapped_only = True
     for f in files:
         rel = f.new_path or f.old_path
         if not rel:
             continue
+        if f.swapped and not f.changes and rel.endswith(".py"):
+            continue
+        if f.changes:
+            swapped_only = False
 
         if f.old_path and f.new_path and f.old_path != f.new_path:
             add_importers(f.old_path)
@@ -790,6 +865,7 @@ def select_tests(
                 for ch in f.changes:
                     if _blank(ch.text) or _comment(ch.text):
                         continue
+                    active_total += 1
                     span = _span_index(scope_groups.get(rel, []), ch.pos)
                     if span is None or SIG_RE.match(ch.text) or IMPORT_RE.match(ch.text) \
                             or DECORATOR_RE.match(ch.text):
@@ -797,7 +873,7 @@ def select_tests(
                         all_covered = False
                     if not _line_tids(rel, ch.pos, line_runs, groups):
                         all_covered = False
-                    handle_position(rel, ch.pos, ch.text)
+                    handle_position(rel, ch.pos, ch.text, ch.pos in f.replaced)
                 if is_dialect_module(rel) and class_level and not all_covered:
                     add_dialect_shared(rel, True)
             continue
@@ -819,6 +895,11 @@ def select_tests(
     result = [(tid, map_ms(tid)) for tid in sorted(chosen)]
 
     if not result:
+        provable_empty = silent_total > 0 and silent_total == active_total
+        if (swapped_only or provable_empty) and any(f.swapped or f.replaced for f in files):
+            # Every change is either an `is`/`==` no-op or a replacement of a
+            # statement no baseline test ever executed: nothing can fail.
+            return []
         if files and core_tests:
             return [(tid, map_ms(tid)) for tid in sorted(core_tests - memory_tids)]
         if smoke[0]:
@@ -1047,7 +1128,7 @@ def main() -> None:
                     for tid, _ in selected
                     if tid in sample_to_runtime
                 ]
-                if not translated:
+                if not translated and selected:
                     translated = _all_tests_selection(all_tests)
             workers = optimize_workers(translated, max_workers=8)
         except Exception as exc:
