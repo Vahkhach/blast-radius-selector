@@ -139,7 +139,7 @@ def _comment(text: str) -> bool:
     return bool(COMMENT_RE.match(text))
 
 
-SAFE_IS_RE = re.compile(r"\bis\s+(?:not\s+)?None\b")
+SAFE_IS_RE = re.compile(r"\bis\s+(?:not\s+)?(?:None|NormalizationStrategy\.[A-Z_]+)\b")
 GENERATOR_RE = re.compile(r"\b(?:yield|await)\b")
 
 
