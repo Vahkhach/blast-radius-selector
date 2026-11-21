@@ -139,9 +139,7 @@ def _comment(text: str) -> bool:
     return bool(COMMENT_RE.match(text))
 
 
-SAFE_IS_RE = re.compile(
-    r"\bis\s+(?:not\s+)?(?:None\b|[A-Z]\w*\.[A-Z][A-Z0-9_]*\b)"
-)
+SAFE_IS_RE = re.compile(r"\bis\s+(?:not\s+)?None\b")
 GENERATOR_RE = re.compile(r"\b(?:yield|await)\b")
 
 
@@ -424,7 +422,7 @@ def select_tests(
         out = set(ids)
         if heavy_exempt(rel):
             return out
-        heavy = {tid for tid in out if map_ms(tid) > HEAVY_TEST_MS}
+        heavy = set()
         if not heavy:
             return out
         out -= heavy
@@ -584,19 +582,7 @@ def select_tests(
 
         if in_scope is not None:
             raw_line_ids = _line_tids(rel, pos, line_runs, groups)
-            if (
-                repl
-                and not structural
-                and not raw_line_ids
-                and not BRANCH_CONT_RE.match(text)
-                and not GENERATOR_RE.search(text)
-            ):
-                # Replacing a statement that no baseline test ever executed is
-                # unobservable: reaching it depends on unchanged control flow,
-                # so no test can observe the new behaviour.
-                nonlocal silent_total
-                silent_total += 1
-                return
+            pass
             # A covered statement can only affect tests that executed it, even
             # when the edited line is a branch header. Continuation lines
             # (`and`/`or`) are the exception: a test may have short-circuited
@@ -646,7 +632,7 @@ def select_tests(
             # that imported the module (the class body runs on import).
             raw_line_ids = _line_tids(rel, pos, line_runs, groups)
             if raw_line_ids:
-                chosen.update(triage_class_level(raw_line_ids))
+                chosen.update(raw_line_ids)
                 return
             add_dialect_family(rel)
             if line_tids and len(line_tids) <= SMALL_ANCHOR_LIMIT:
@@ -889,7 +875,6 @@ def select_tests(
     if use_all:
         return safe_all_selected()
 
-    chosen -= memory_tids
     if sample_ids:
         chosen &= sample_ids
     result = [(tid, map_ms(tid)) for tid in sorted(chosen)]
@@ -901,7 +886,7 @@ def select_tests(
             # statement no baseline test ever executed: nothing can fail.
             return []
         if files and core_tests:
-            return [(tid, map_ms(tid)) for tid in sorted(core_tests - memory_tids)]
+            return [(tid, map_ms(tid)) for tid in sorted(core_tests)]
         if smoke[0]:
             result = [smoke]
         else:
