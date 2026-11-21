@@ -373,6 +373,7 @@ def build_fixture_index(
             tree = ast.parse(text)
         except (OSError, SyntaxError):
             continue
+        lines = text.splitlines()
         spans = _test_method_spans(rel, path)
 
         for node in ast.walk(tree):
@@ -382,12 +383,17 @@ def build_fixture_index(
             if not value or len(value) > 240 or set(value) <= {".", "/", " ", "\\"}:
                 continue
             line = getattr(node, "lineno", 0)
+            line_text = lines[line - 1] if 0 < line <= len(lines) else ""
             tids = owner_tids(rel, line, spans)
             if not tids:
                 continue
             if value.startswith(FIXTURE_ROOT):
                 add_path(value, tids)
             elif not value.startswith(("/", "http:", "https:")):
+                # Bare words are only directory references when they sit next
+                # to the fixture root (os.path.join(FIXTURES_DIR, "jsonpath")).
+                if "/" not in value and "." not in value and "FIXTURE" not in line_text:
+                    continue
                 for candidate in (
                     FIXTURE_ROOT + value,
                     FIXTURE_ROOT + "optimizer/" + value,
@@ -406,6 +412,7 @@ def build_fixture_index(
             for candidate in (
                 FIXTURE_ROOT + "optimizer/" + value + ".sql",
                 FIXTURE_ROOT + value + ".sql",
+                FIXTURE_ROOT + value + "/",
             ):
                 add_path(candidate, tids)
 

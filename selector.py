@@ -15,6 +15,7 @@ import gzip
 import json
 import math
 import pickle
+import random
 import re
 import sys
 from pathlib import Path
@@ -27,6 +28,9 @@ DECORATOR_RE = re.compile(r"^\s*@")
 IMPORT_RE = re.compile(r"^\s*(?:from\s+\S+\s+import|import\s+)")
 GLOBAL_RE = re.compile(r"^\s*(?:global|nonlocal)\s+")
 COMMENT_RE = re.compile(r"^\s*#")
+BRANCH_RE = re.compile(
+    r"^\s*(?:if|elif|else|while|for|match|case|except|try|finally|with)\b"
+)
 
 COST_PER_WORKER = 2000
 MEMORY_TEST_SUFFIX = "::test_generator_memory"
@@ -34,6 +38,10 @@ SMALL_ANCHOR_LIMIT = 120
 SPAN_ANCHOR_LIMIT = 20
 CLASS_REF_LIMIT = 400
 SMALL_SET_MS = 1500
+HEAVY_TEST_MS = 5000
+FAST_EXECUTOR_MS = 1000
+PACK_RESTARTS = 25
+PACK_SEED = 42
 
 DIALECT_PREFIXES = (
     "sqlglot/dialects/",
@@ -61,6 +69,8 @@ CORE_DYNAMIC_FILES = {
     "sqlglot/tokens.py",
     "sqlglot/transforms.py",
 }
+HEAVY_EXEMPT_PREFIXES = ("sqlglot/executor/", "sqlglot/optimizer/")
+HEAVY_EXEMPT_FILES = {"sqlglot/planner.py"}
 
 
 def load_tests(tests_path: Path) -> list[tuple[int, str, str, int]]:
@@ -337,6 +347,13 @@ def select_tests(
     memory_tids = prep["memory_tids"]
     serialization_prefixes = prep["serialization_prefixes"]
     all_ms = {tid: ms for tid, _, _, ms in all_tests}
+    fast_executor = {
+        tid for tid in sorted(
+            file_to_tests.get(EXECUTOR_FILE, ()),
+            key=lambda t: (all_ms.get(t, 0), t),
+        )[:8]
+        if 0 < all_ms.get(tid, 0) <= FAST_EXECUTOR_MS
+    }
     smoke = min(
         ((tid, ms) for tid, nodeid, _, ms in all_tests if not nodeid.endswith(MEMORY_TEST_SUFFIX)),
         key=lambda x: (x[1], x[0]),
@@ -348,6 +365,23 @@ def select_tests(
 
     def map_ms(tid: int) -> int:
         return all_ms.get(tid, 0)
+
+    def heavy_exempt(rel: str) -> bool:
+        return rel.startswith(HEAVY_EXEMPT_PREFIXES) or rel in HEAVY_EXEMPT_FILES
+
+    def narrow_extension(ids, rel: str) -> set[int]:
+        # Indirect expansion (module/importers/class/dialect fallbacks) must not
+        # drag the 21 s TPC executor tests into a patch that does not touch the
+        # executor/optimizer/planner. Replace them with cheap executor tests.
+        out = set(ids)
+        if heavy_exempt(rel):
+            return out
+        heavy = {tid for tid in out if map_ms(tid) > HEAVY_TEST_MS}
+        if not heavy:
+            return out
+        out -= heavy
+        out |= fast_executor
+        return out
 
     def safe_all_selected() -> list[tuple[int, int]]:
         if sample_ids:
@@ -369,12 +403,12 @@ def select_tests(
         gid = module_groups.get(rel)
         if gid is None:
             return False
-        return add_ids(groups[gid])
+        return add_ids(narrow_extension(groups[gid], rel))
 
     def add_importers(rel: str) -> bool:
         before = len(chosen)
         for test_file in importers.get(rel, ()):
-            chosen.update(file_to_tests.get(test_file, ()))
+            chosen.update(narrow_extension(file_to_tests.get(test_file, ()), rel))
         return len(chosen) > before
 
     def fallback_core() -> None:
@@ -391,7 +425,7 @@ def select_tests(
         if add_module(rel):
             return
         if is_dialect_module(rel) and dialect_core_tests:
-            chosen.update(dialect_core_tests)
+            chosen.update(narrow_extension(dialect_core_tests, rel))
             return
         fallback_core()
 
@@ -407,7 +441,7 @@ def select_tests(
         ids = set(groups[gid])
         for test_file, tids in file_to_tests.items():
             if test_file == EXECUTOR_FILE or test_file.startswith("tests/dataframe/"):
-                chosen.update(ids & tids)
+                chosen.update(narrow_extension(ids & tids, rel))
 
     def add_dialect_family(rel: str) -> None:
         for stem in dialects.get(rel, ()):
@@ -456,7 +490,7 @@ def select_tests(
         ids = groups[gid]
         if not unlimited and len(ids) > CLASS_REF_LIMIT:
             return set()
-        return set(ids)
+        return narrow_extension(ids, rel)
 
     def add_scope_near(rel: str, pos: int) -> bool:
         for delta in (0, -1, 1):
@@ -498,27 +532,19 @@ def select_tests(
         in_scope = _span_index(scope_groups.get(rel, []), pos)
 
         if in_scope is not None:
-            if structural:
-                mod_ok = add_module(rel)
-                imp_ok = add_importers(rel)
-                cls_ok = add_ids(class_consumer_tids(rel, pos, unlimited=True))
-                add_core_consumers(rel)
-                if not (mod_ok or imp_ok or cls_ok):
-                    fallback_core()
-                return
-            # Any edit inside a function invalidates every path through that
-            # function, not just the tests that happened to execute this line.
-            # The full scope group and the exact line runs are the coverage
-            # evidence for the function; widening to the module would pull in
-            # every test that touches any other function in the file.
-            span = _span_index(scope_groups.get(rel, []), pos)
-            line_ids = line_tids_near(rel, pos)
-            if span is not None:
-                chosen.update(groups[span[2]])
-            if line_ids:
-                chosen.update(line_ids)
-            if span is None and not line_ids:
-                module_or_core(rel)
+            branch = bool(BRANCH_RE.match(text)) or bool(GLOBAL_RE.match(text))
+            raw_line_ids = _line_tids(rel, pos, line_runs, groups)
+            if structural or branch or not raw_line_ids:
+                # A signature/branch edit, or a line with no baseline
+                # coverage (e.g. a new branch), can change every path through
+                # the function, so the full scope is required.
+                chosen.update(groups[in_scope[2]])
+                if structural:
+                    chosen.update(class_consumer_tids(rel, pos, unlimited=True))
+            else:
+                # Covered, non-branch line inside a function: the changed
+                # statement only runs in the tests that executed it.
+                chosen.update(line_tids_near(rel, pos))
             if is_dialect_module(rel):
                 add_dialect_family(rel)
             return
@@ -544,6 +570,13 @@ def select_tests(
         extra = small_span_tids(rel, pos, line_keys)
 
         if is_dialect_module(rel):
+            # Class-level dialect constants are narrowed to the tests that
+            # executed the changed lines; those already include every test
+            # that imported the module (the class body runs on import).
+            raw_line_ids = _line_tids(rel, pos, line_runs, groups)
+            if raw_line_ids:
+                chosen.update(raw_line_ids)
+                return
             add_dialect_family(rel)
             if line_tids and len(line_tids) <= SMALL_ANCHOR_LIMIT:
                 chosen.update(line_tids)
@@ -605,17 +638,17 @@ def select_tests(
         # whole file is the fallback only when coverage has no evidence.
         scoped_transpile = module_ids & file_to_tests.get(TRANSPILE_FILE, set())
         if scoped_transpile:
-            chosen.update(scoped_transpile)
+            chosen.update(narrow_extension(scoped_transpile, rel))
         elif class_level:
             add_test_file(TRANSPILE_FILE)
         scoped_dialect = module_ids & file_to_tests.get(DIALECT_TEST_FILE, set())
         if scoped_dialect:
-            chosen.update(scoped_dialect)
+            chosen.update(narrow_extension(scoped_dialect, rel))
         elif class_level:
             add_test_file(DIALECT_TEST_FILE)
         scoped_opt = module_ids & file_to_tests.get(OPTIMIZER_FILE, set())
         if scoped_opt:
-            chosen.update(scoped_opt)
+            chosen.update(narrow_extension(scoped_opt, rel))
         add_test_file(LINEAGE_FILE)
         add_dialect_family(rel)
 
@@ -753,13 +786,19 @@ def select_tests(
                 handle_comments(rel, f)
             else:
                 class_level = False
+                all_covered = True
                 for ch in f.changes:
+                    if _blank(ch.text) or _comment(ch.text):
+                        continue
                     span = _span_index(scope_groups.get(rel, []), ch.pos)
                     if span is None or SIG_RE.match(ch.text) or IMPORT_RE.match(ch.text) \
                             or DECORATOR_RE.match(ch.text):
                         class_level = True
+                        all_covered = False
+                    if not _line_tids(rel, ch.pos, line_runs, groups):
+                        all_covered = False
                     handle_position(rel, ch.pos, ch.text)
-                if is_dialect_module(rel) and class_level:
+                if is_dialect_module(rel) and class_level and not all_covered:
                     add_dialect_shared(rel, True)
             continue
 
@@ -789,42 +828,52 @@ def select_tests(
     return result
 
 
-def _pack(items: list[tuple[int, int]], k: int) -> tuple[int, list[list[int]]]:
-    if k <= 0:
-        return 0, []
-    if k >= len(items):
-        return max((ms for _, ms in items), default=0), [[tid] for tid, _ in items]
+def _lpt(items: list[tuple[int, int]], k: int) -> tuple[list[int], list[list[tuple[int, int]]]]:
     loads = [0] * k
     bins: list[list[tuple[int, int]]] = [[] for _ in range(k)]
     for tid, ms in items:
         idx = min(range(k), key=loads.__getitem__)
         loads[idx] += ms
         bins[idx].append((tid, ms))
+    return loads, bins
 
-    # Local search on the heaviest/lightest bins only: optimal packs almost
-    # always involve those, and n^2 scans over all bins dominate CPU.
-    for _ in range(40):
+
+def _local_search(
+    loads: list[int], bins: list[list[tuple[int, int]]], passes: int = 8, cap: int = 32
+) -> None:
+    k = len(bins)
+    for _ in range(passes):
         order = sorted(range(k), key=loads.__getitem__, reverse=True)
         improved = False
-        for hi in order[:4]:
-            for lo in reversed(order[-4:]):
-                if hi == lo or loads[hi] <= loads[lo]:
+        for hi in order:
+            for lo in order:
+                if hi == lo:
                     continue
                 gap = loads[hi] - loads[lo]
+                if gap <= 0:
+                    continue
+                heavy = bins[hi]
+                light = bins[lo]
                 best_gain = 0
-                best_move = None
-                heavy = sorted(bins[hi], key=lambda x: x[1], reverse=True)[:16]
-                light = sorted(bins[lo], key=lambda x: x[1])[:16]
-                for a in range(len(heavy)):
-                    ms_a = heavy[a][1]
-                    if 0 < ms_a < gap:
-                        gain = min(ms_a, gap - ms_a)
+                best_a = None
+                best_b = None
+                for a, (_, ms) in enumerate(heavy):
+                    if 0 < ms < gap:
+                        gain = min(ms, gap - ms)
                         if gain > best_gain:
                             best_gain = gain
-                            best_move = (a, None)
-                for a in range(len(heavy)):
-                    for b in range(len(light)):
-                        ms_a = heavy[a][1]
+                            best_a, best_b = a, None
+                hs = (
+                    range(len(heavy)) if len(heavy) <= cap
+                    else sorted(range(len(heavy)), key=lambda i: heavy[i][1], reverse=True)[:cap]
+                )
+                ls = (
+                    range(len(light)) if len(light) <= cap
+                    else sorted(range(len(light)), key=lambda i: light[i][1])[:cap]
+                )
+                for a in hs:
+                    ms_a = heavy[a][1]
+                    for b in ls:
                         ms_b = light[b][1]
                         if ms_a <= ms_b:
                             continue
@@ -832,27 +881,54 @@ def _pack(items: list[tuple[int, int]], k: int) -> tuple[int, list[list[int]]]:
                         gain = loads[hi] - new_max
                         if gain > best_gain:
                             best_gain = gain
-                            best_move = (a, b)
-                if best_move is None:
+                            best_a, best_b = a, b
+                if best_a is None or best_gain <= 0:
                     continue
-                a, b = best_move
-                if b is None:
-                    item = bins[hi].pop(bins[hi].index(heavy[a]))
-                    bins[lo].append(item)
+                if best_b is None:
+                    item = heavy.pop(best_a)
+                    light.append(item)
                     loads[hi] -= item[1]
                     loads[lo] += item[1]
                 else:
-                    ia = bins[hi].index(heavy[a])
-                    ib = bins[lo].index(light[b])
-                    bins[hi][ia], bins[lo][ib] = light[b], heavy[a]
-                    loads[hi] += light[b][1] - heavy[a][1]
-                    loads[lo] += heavy[a][1] - light[b][1]
+                    ia = heavy[best_a]
+                    ib = light[best_b]
+                    heavy[best_a] = ib
+                    light[best_b] = ia
+                    loads[hi] += ib[1] - ia[1]
+                    loads[lo] += ia[1] - ib[1]
                 improved = True
         if not improved:
             break
 
-    non_empty = [[tid for tid, _ in b] for b in bins if b]
-    return max(loads), non_empty
+
+def _pack(items: list[tuple[int, int]], k: int) -> tuple[int, list[list[int]]]:
+    if k <= 0:
+        return 0, []
+    if k >= len(items):
+        return max((ms for _, ms in items), default=0), [[tid] for tid, _ in items]
+    loads, bins = _lpt(items, k)
+    _local_search(loads, bins)
+    return max(loads), [[tid for tid, _ in b] for b in bins if b]
+
+
+def _pack_restarts(items: list[tuple[int, int]], k: int, tries: int = PACK_RESTARTS) -> tuple[int, list[list[int]]]:
+    """LPT + full local search, refined by deterministic randomized restarts."""
+    if k <= 1:
+        return _pack(items, k)
+    if k >= len(items):
+        return max((ms for _, ms in items), default=0), [[tid] for tid, _ in items]
+    rng = random.Random(PACK_SEED)
+    best_max, best_bins = _pack(items, k)
+    for _ in range(tries):
+        jittered = [(tid, ms, ms * rng.uniform(0.75, 1.25)) for tid, ms in items]
+        jittered.sort(key=lambda x: -x[2])
+        loads, bins = _lpt([(tid, ms) for tid, ms, _ in jittered], k)
+        _local_search(loads, bins, passes=4)
+        cur = max(loads)
+        if cur < best_max:
+            best_max = cur
+            best_bins = [[tid for tid, _ in b] for b in bins if b]
+    return best_max, best_bins
 
 
 def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> list[list[int]]:
@@ -865,6 +941,7 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
     ms_by_id = dict(ordered)
     best_cost = 1 << 62
     best: list[list[int]] = []
+    best_spec: tuple[str, int] | None = None
 
     for k in range(1, limit + 1):
         largest, bins = _pack(ordered, k)
@@ -872,6 +949,7 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
         if cost < best_cost:
             best_cost = cost
             best = bins
+            best_spec = ("full", k)
 
     if limit > 1:
         heavy = ordered[0]
@@ -883,6 +961,22 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
             if cost < best_cost:
                 best_cost = cost
                 best = [[heavy[0]]] + bins
+                best_spec = ("heavy", k)
+
+    if best_spec is not None and best_spec[1] > 1:
+        kind, k = best_spec
+        if kind == "full":
+            largest, bins = _pack_restarts(ordered, k)
+            cost = largest + COST_PER_WORKER * len(bins)
+        else:
+            heavy = ordered[0]
+            largest, bins = _pack_restarts(ordered[1:], k - 1)
+            loads = [heavy[1]] + [sum(ms_by_id[t] for t in b) for b in bins]
+            cost = max(loads) + COST_PER_WORKER * k
+            bins = [[heavy[0]]] + bins
+        if cost < best_cost:
+            best_cost = cost
+            best = bins
 
     return best
 
