@@ -3,7 +3,9 @@ FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/tmp \
-    SQLGLOT_SRC=/opt/sqlglot
+    SQLGLOT_SRC=/opt/sqlglot \
+    PYTHONPATH=/opt/sqlglot \
+    SKIP_INTEGRATION=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*

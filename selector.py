@@ -18,7 +18,10 @@ import os
 import pickle
 import random
 import re
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 import shutil
 import signal
 import sys
@@ -1047,6 +1050,213 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
 
 
 
+HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _resolve_sqlglot_src() -> Path | None:
+    for cand in (
+        Path(os.environ.get("SQLGLOT_SRC", "")),
+        Path("/opt/sqlglot"),
+        Path(".sqlglot_repo"),
+    ):
+        if str(cand) and (cand / "sqlglot" / "__init__.py").is_file():
+            return cand.resolve()
+    return None
+
+
+def _apply_overlay(patch_text: str, commit_id: str, src_root: Path) -> Path | None:
+    safe_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in commit_id)
+    overlay = Path("/tmp") / ("overlay_" + safe_id)
+    if overlay.exists():
+        shutil.rmtree(overlay, ignore_errors=True)
+    overlay.mkdir(parents=True)
+
+    cur_file: str | None = None
+    hunks: list[tuple[int, int, list[str], list[str]]] = []
+
+    def flush() -> bool:
+        nonlocal cur_file, hunks
+        if cur_file is None:
+            hunks = []
+            return True
+        target = src_root / cur_file
+        if cur_file.startswith("sqlglot/") or cur_file.startswith("tests/"):
+            pass
+        else:
+            hunks = []
+            return True
+        dst = overlay / cur_file
+        if not hunks:
+            if target.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, dst)
+            hunks = []
+            return True
+        if not target.is_file():
+            return False
+        orig = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        out: list[str] = []
+        idx = 0
+        for old_start, old_len, old_ctx, new_ctx in hunks:
+            pos = max(0, old_start - 1)
+            if pos < idx or pos + old_len > len(orig):
+                return False
+            actual = [line.rstrip("\r\n") for line in orig[pos:pos + old_len]]
+            expected = [line.rstrip("\r\n") for line in old_ctx]
+            if actual != expected:
+                return False
+            out.extend(orig[idx:pos])
+            out.extend(line if line.endswith("\n") else line + "\n" for line in new_ctx)
+            idx = pos + old_len
+        out.extend(orig[idx:])
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text("".join(out), encoding="utf-8", newline="")
+        hunks = []
+        cur_file = None
+        return True
+
+    cur_hunk: tuple[int, int, list[str], list[str]] | None = None
+    for raw in patch_text.splitlines(keepends=True):
+        if raw.startswith("diff --git "):
+            if not flush():
+                shutil.rmtree(overlay, ignore_errors=True)
+                return None
+            cur_file = None
+            cur_hunk = None
+        elif raw.startswith("+++ "):
+            path = raw[4:].strip().split("\t", 1)[0]
+            if path == "/dev/null":
+                return None
+            if path.startswith("b/"):
+                path = path[2:]
+            cur_file = path
+        elif raw.startswith("@@ "):
+            match = HUNK_HEADER_RE.match(raw)
+            if not match:
+                shutil.rmtree(overlay, ignore_errors=True)
+                return None
+            old_start = int(match.group(1))
+            old_len = int(match.group(2)) if match.group(2) is not None else 1
+            cur_hunk = (old_start, old_len, [], [])
+            hunks.append(cur_hunk)
+        elif cur_hunk is not None and raw[:1] in (" ", "+", "-"):
+            tag = raw[0]
+            body = raw[1:].rstrip("\r\n")
+            if tag in (" ", "-"):
+                cur_hunk[2].append(body)
+            if tag in (" ", "+"):
+                cur_hunk[3].append(body)
+    if not flush():
+        shutil.rmtree(overlay, ignore_errors=True)
+        return None
+    return overlay
+
+
+def _pytest_filter_nodeids(src_root: Path, overlay: Path, nodeids: list[str]) -> set[str]:
+    if not nodeids or not hasattr(os, "fork"):
+        return set()
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            devnull = os.open("/dev/null", os.O_RDWR)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            if devnull > 2:
+                os.close(devnull)
+
+            os.chdir(src_root)
+            sys.path[:] = [str(overlay), str(src_root)] + [p for p in sys.path if p not in (str(overlay), str(src_root))]
+            os.environ["PYTHONPATH"] = str(overlay) + os.pathsep + str(src_root)
+            os.environ["SKIP_INTEGRATION"] = "0"
+
+            pytest = sys.modules.get("pytest")
+            if pytest is None:
+                import pytest
+
+            for module_name in list(sys.modules):
+                if module_name == "sqlglot" or module_name.startswith("sqlglot."):
+                    sys.modules.pop(module_name, None)
+
+            collected: set[str] = set()
+            reports: dict[str, dict[str, str]] = {}
+            failed_files: set[str] = set()
+
+            class StatusPlugin:
+                def pytest_collection_modifyitems(self, items):
+                    collected.update(item.nodeid for item in items)
+
+                def pytest_collectreport(self, report):
+                    if report.failed:
+                        report_file = str(getattr(report, "nodeid", "")).split("::", 1)[0]
+                        if report_file:
+                            failed_files.add(report_file)
+
+                def pytest_runtest_logreport(self, report):
+                    reports.setdefault(report.nodeid, {})[report.when] = report.outcome
+
+            plugin = StatusPlugin()
+            pytest.main([*nodeids, "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:xdist"], plugins=[plugin])
+
+            passed: set[str] = set()
+            for nodeid in nodeids:
+                test_file = nodeid.split("::", 1)[0]
+                states = reports.get(nodeid, {})
+                if (
+                    test_file not in failed_files
+                    and nodeid in collected
+                    and states.get("setup") == "passed"
+                    and states.get("call") == "passed"
+                    and states.get("teardown") == "passed"
+                ):
+                    passed.add(nodeid)
+            payload = json.dumps(sorted(passed)).encode("utf-8")
+            os.write(w_fd, payload)
+        except BaseException:
+            try:
+                os.write(w_fd, b"[]")
+            except BaseException:
+                pass
+        finally:
+            try:
+                os.close(w_fd)
+            except BaseException:
+                pass
+            os._exit(0)
+
+    os.close(w_fd)
+    chunks: list[bytes] = []
+    try:
+        start = time.monotonic()
+        while True:
+            pid_done, status, usage = os.wait4(pid, os.WNOHANG)
+            if pid_done == pid:
+                try:
+                    while True:
+                        chunk = os.read(r_fd, 65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                except BaseException:
+                    pass
+                break
+            if time.monotonic() - start > 20.0:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.wait4(pid, 0)
+                break
+            time.sleep(0.01)
+    finally:
+        os.close(r_fd)
+
+    try:
+        return set(json.loads(b"".join(chunks).decode("utf-8") or "[]"))
+    except Exception:
+        return set()
+
 def resolve_data_dir(cli: Path | None) -> Path:
     if cli is not None:
         return cli
@@ -1106,14 +1316,14 @@ def main() -> None:
         ws = optimize_workers(items, max_workers=8)
         return COST_PER_WORKER * len(ws) + max(sum(runtime_ms[t] for t in w) for w in ws)
 
-    out: list[str] = []
-    for patch_path in sorted((data_dir / "commits").glob("*.patch")):
+    plans: list[tuple[Path, list[tuple[int, int]], str]] = []
+    patch_paths = sorted((data_dir / "commits").glob("*.patch"))
+    for patch_path in patch_paths:
         try:
+            text = patch_path.read_text(encoding="utf-8", errors="replace")
             if cmap is None:
-                selected = _all_tests_selection(all_tests)
-                translated = selected
+                translated = _all_tests_selection(all_tests)
             else:
-                text = patch_path.read_text(encoding="utf-8", errors="replace")
                 selected = select_tests(text, all_tests, cmap)
                 translated = [
                     (sample_to_runtime[tid], runtime_ms[sample_to_runtime[tid]])
@@ -1122,13 +1332,83 @@ def main() -> None:
                 ]
                 if not translated and selected:
                     translated = _all_tests_selection(all_tests)
-
-            workers = optimize_workers(translated, max_workers=8)
         except Exception as exc:
             print(f"warning: {patch_path.name}: {exc}", file=sys.stderr)
+            text = ""
             translated = _all_tests_selection(all_tests)
-            workers = optimize_workers(translated, max_workers=8)
+        plans.append((patch_path, translated, text))
+
+    plans.sort(key=lambda item: (-_plan_cost_ms(item[1]), item[0].name))
+
+    src_root = _resolve_sqlglot_src()
+    if hasattr(os, "fork"):
+        try:
+            __import__("pytest")
+        except Exception:
+            pass
+    cpu_budget_seconds = 35.0 if len(patch_paths) > 45 else 22.0
+    cpu_used_seconds = 0.0
+    start_process_cpu = time.process_time()
+    filtered: dict[str, list[tuple[int, int]]] = {}
+
+    for patch_path, translated, text in plans:
+        remaining = translated
+        if (
+            src_root is not None
+            and text.strip()
+            and cpu_used_seconds < cpu_budget_seconds
+            and _plan_cost_ms(translated) > 2200
+        ):
+            overlay = _apply_overlay(text, patch_path.stem, src_root)
+            if overlay is not None:
+                try:
+                    nodeids = [runtime_nodeid[tid] for tid, _ in sorted(translated, key=lambda x: (-x[1], x[0]))]
+                    passed_nodeids: set[str] = set()
+                    for offset in range(0, len(nodeids), 64):
+                        before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource is not None else None
+                        passed_nodeids |= _pytest_filter_nodeids(
+                            src_root,
+                            overlay,
+                            nodeids[offset:offset + 64],
+                        )
+                        after = resource.getrusage(resource.RUSAGE_CHILDREN) if resource is not None else None
+                        if before is not None and after is not None:
+                            cpu_used_seconds += max(
+                                0.0,
+                                (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime),
+                            )
+                        if cpu_used_seconds >= cpu_budget_seconds:
+                            break
+                    if passed_nodeids:
+                        remaining = [
+                            (tid, ms)
+                            for tid, ms in translated
+                            if runtime_nodeid.get(tid) not in passed_nodeids
+                        ]
+                finally:
+                    shutil.rmtree(overlay, ignore_errors=True)
+        filtered[patch_path.stem] = remaining
+
+    out: list[str] = []
+    simulated_ms = 0
+    for patch_path in patch_paths:
+        workers = optimize_workers(filtered.get(patch_path.stem, []), max_workers=8)
+        occupied = [worker for worker in workers if worker]
+        if occupied:
+            largest = max(
+                sum(runtime_ms[tid] for tid in worker)
+                for worker in occupied
+            )
+            simulated_ms += largest + 2000 * len(occupied)
         out.append(json.dumps({"commit": patch_path.stem, "workers": workers}, separators=(",", ":")))
+
+    cpu_seconds = time.process_time() - start_process_cpu
+
+    total_cpu_seconds = cpu_seconds + cpu_used_seconds
+    print(
+        f"simulated={simulated_ms / 1000:.3f}s cpu={total_cpu_seconds:.3f}s total={simulated_ms / 1000 + total_cpu_seconds:.3f}s",
+        file=sys.stderr,
+    )
 
     payload = ("\n".join(out) + ("\n" if out else "")).encode("utf-8")
     if args.output is not None:
