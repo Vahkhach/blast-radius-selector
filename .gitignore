@@ -13,3 +13,4 @@ _exp/
 .coverage
 coverage_map_v2.json.gz
 coverage_map_v3.json.gz
+.aider*

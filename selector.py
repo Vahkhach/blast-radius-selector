@@ -14,10 +14,16 @@ import argparse
 import gzip
 import json
 import math
+import os
 import pickle
 import random
 import re
+import resource
+import shutil
+import signal
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -108,7 +114,7 @@ class Change:
 class PatchFile:
     __slots__ = (
         "old_path", "new_path", "is_new", "is_deleted", "changes", "trivial_only",
-        "swapped", "replaced",
+        "replaced",
     )
 
     def __init__(self) -> None:
@@ -118,7 +124,6 @@ class PatchFile:
         self.is_deleted = False
         self.changes: list[Change] = []
         self.trivial_only = True
-        self.swapped = False
         self.replaced: set[int] = set()
 
 
@@ -139,25 +144,7 @@ def _comment(text: str) -> bool:
     return bool(COMMENT_RE.match(text))
 
 
-PURE_IDENTITY_ENUMS = ("DType", "ErrorLevel", "IsPredicatePrecedence", "PropertiesLocation", "ScopeType", "TrieResult")
-SAFE_IS_RE = re.compile(
-    r"\bis\s+(?:not\s+)?(?:None\b|(?:" + "|".join(PURE_IDENTITY_ENUMS) + r")\.[A-Z][A-Z0-9_]*\b)"
-)
 GENERATOR_RE = re.compile(r"\b(?:yield|await)\b")
-
-
-def _equiv_swap(minus: list[tuple[int, str]], plus: list[tuple[int, str]]) -> bool:
-    # Only `X is None` / `X is Enum.MEMBER` -> `==` swaps are no-ops here:
-    # identity and equality agree for None and Enum members, while arbitrary
-    # `is` -> `==` rewrites can change behaviour for other objects.
-    if not minus or len(minus) != len(plus):
-        return False
-    for (_, m), (_, p) in zip(minus, plus):
-        if not SAFE_IS_RE.search(m):
-            return False
-        if m.replace(" is not ", " != ").replace(" is ", " == ") != p:
-            return False
-    return True
 
 
 def parse_patch(text: str) -> tuple[list[PatchFile], bool]:
@@ -173,10 +160,6 @@ def parse_patch(text: str) -> tuple[list[PatchFile], bool]:
     def flush_block() -> None:
         nonlocal minus, plus, block_anchor
         if cur is None:
-            minus, plus, block_anchor = [], [], None
-            return
-        if _equiv_swap(minus, plus):
-            cur.swapped = True
             minus, plus, block_anchor = [], [], None
             return
         if minus and plus and len(minus) == len(plus):
@@ -398,8 +381,6 @@ def select_tests(
     )
 
     chosen: set[int] = set()
-    silent_total = 0
-    active_total = 0
     use_all = not had
 
     def map_ms(tid: int) -> int:
@@ -667,26 +648,21 @@ def select_tests(
             module_or_core(rel)
 
     def handle_comments(rel: str, f: PatchFile) -> None:
-        pure_comment = all(_blank(ch.text) or _comment(ch.text) for ch in f.changes)
-        if pure_comment:
-            # Comments do not change bytecode, but source/doctest introspection
-            # can observe them, so those tests must still run.
-            if introspection:
-                chosen.update(introspection)
-                return
-            for ch in f.changes:
-                if add_scope_near(rel, ch.pos):
-                    return
+        covered = False
+        for ch in f.changes:
+            if add_scope_near(rel, ch.pos):
+                covered = True
+            handle_position(rel, ch.pos, ch.text)
+        covered = add_module(rel) or add_importers(rel) or covered
+        if rel.startswith("sqlglot/"):
+            add_core_consumers(rel)
+            if is_dialect_module(rel):
+                add_dialect_shared(rel, class_level=True)
+        if not covered:
             stem = Path(rel).stem
             for test_file in (f"tests/dialects/test_{stem}.py", f"tests/test_{stem}.py"):
                 if file_to_tests.get(test_file):
                     chosen.update(file_to_tests[test_file])
-                    return
-            fallback_core()
-            return
-
-        for ch in f.changes:
-            handle_position(rel, ch.pos, ch.text)
         if introspection:
             chosen.update(introspection)
 
@@ -771,16 +747,10 @@ def select_tests(
                     matched = True
         return matched
 
-    swapped_only = True
     for f in files:
         rel = f.new_path or f.old_path
         if not rel:
             continue
-        if f.swapped and not f.changes and rel.endswith(".py"):
-            continue
-        if f.changes:
-            swapped_only = False
-
         if f.old_path and f.new_path and f.old_path != f.new_path:
             add_importers(f.old_path)
             add_importers(f.new_path)
@@ -854,7 +824,6 @@ def select_tests(
                 for ch in f.changes:
                     if _blank(ch.text) or _comment(ch.text):
                         continue
-                    active_total += 1
                     span = _span_index(scope_groups.get(rel, []), ch.pos)
                     if span is None or SIG_RE.match(ch.text) or IMPORT_RE.match(ch.text) \
                             or DECORATOR_RE.match(ch.text):
@@ -883,11 +852,6 @@ def select_tests(
     result = [(tid, map_ms(tid)) for tid in sorted(chosen)]
 
     if not result:
-        provable_empty = silent_total > 0 and silent_total == active_total
-        if (swapped_only or provable_empty) and any(f.swapped or f.replaced for f in files):
-            # Every change is either an `is`/`==` no-op or a replacement of a
-            # statement no baseline test ever executed: nothing can fail.
-            return []
         if files and core_tests:
             return [(tid, map_ms(tid)) for tid in sorted(core_tests)]
         if smoke[0]:
@@ -1000,305 +964,87 @@ def _pack_restarts(items: list[tuple[int, int]], k: int, tries: int = PACK_RESTA
     return best_max, best_bins
 
 
+def _exact_partition(items: list[tuple[int, int]], k: int) -> tuple[int, list[list[int]]]:
+    if k <= 1:
+        return sum(ms for _, ms in items), [[tid for tid, _ in items]]
+    if k >= len(items):
+        return max((ms for _, ms in items), default=0), [[tid] for tid, _ in items]
+
+    desc = sorted(items, key=lambda x: (-x[1], x[0]))
+    total = sum(ms for _, ms in desc)
+    low = max(desc[0][1], (total + k - 1) // k)
+    lpt_max, lpt_bins = _pack(desc, k)
+    high = lpt_max
+
+    def feasible(cap: int) -> list[int] | None:
+        loads = [0] * k
+        assignment = [-1] * len(desc)
+        seen_states: set[tuple[int, tuple[int, ...]]] = set()
+
+        def dfs(idx: int) -> bool:
+            if idx == len(desc):
+                return True
+            state = (idx, tuple(sorted(loads, reverse=True)))
+            if state in seen_states:
+                return False
+            seen_states.add(state)
+            ms = desc[idx][1]
+            tried: set[int] = set()
+            for b in range(k):
+                ld = loads[b]
+                if ld in tried or ld + ms > cap:
+                    continue
+                tried.add(ld)
+                loads[b] += ms
+                assignment[idx] = b
+                if dfs(idx + 1):
+                    return True
+                loads[b] -= ms
+                assignment[idx] = -1
+            return False
+
+        return assignment if dfs(0) else None
+
+    while low < high:
+        mid = (low + high) // 2
+        if feasible(mid) is not None:
+            high = mid
+        else:
+            low = mid + 1
+
+    assignment = feasible(low)
+    if assignment is None:
+        return lpt_max, lpt_bins
+    bins: list[list[int]] = [[] for _ in range(k)]
+    for idx, b in enumerate(assignment):
+        bins[b].append(desc[idx][0])
+    bins = [b for b in bins if b]
+    return low, bins
+
+
 def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> list[list[int]]:
     if not selected:
         return []
     ordered = sorted(selected, key=lambda x: (-x[1], x[0]))
     if sum(ms for _, ms in ordered) <= SMALL_SET_MS:
         return [[tid for tid, _ in ordered]]
+
     limit = min(max_workers, len(ordered))
-    ms_by_id = dict(ordered)
     best_cost = 1 << 62
     best: list[list[int]] = []
-    best_spec: tuple[str, int] | None = None
-
     for k in range(1, limit + 1):
-        largest, bins = _pack(ordered, k)
+        if len(ordered) <= 32:
+            largest, bins = _exact_partition(ordered, k)
+        elif k == 1:
+            largest, bins = sum(ms for _, ms in ordered), [[tid for tid, _ in ordered]]
+        else:
+            largest, bins = _pack_restarts(ordered, k)
         cost = largest + COST_PER_WORKER * len(bins)
         if cost < best_cost:
             best_cost = cost
             best = bins
-            best_spec = ("full", k)
-
-    if limit > 1:
-        heavy = ordered[0]
-        rest = ordered[1:]
-        for k in range(2, limit + 1):
-            _, bins = _pack(rest, k - 1)
-            loads = [heavy[1]] + [sum(ms_by_id[t] for t in b) for b in bins]
-            cost = max(loads) + COST_PER_WORKER * k
-            if cost < best_cost:
-                best_cost = cost
-                best = [[heavy[0]]] + bins
-                best_spec = ("heavy", k)
-
-    if best_spec is not None and best_spec[1] > 1:
-        kind, k = best_spec
-        if kind == "full":
-            largest, bins = _pack_restarts(ordered, k)
-            cost = largest + COST_PER_WORKER * len(bins)
-        else:
-            heavy = ordered[0]
-            largest, bins = _pack_restarts(ordered[1:], k - 1)
-            loads = [heavy[1]] + [sum(ms_by_id[t] for t in b) for b in bins]
-            cost = max(loads) + COST_PER_WORKER * k
-            bins = [[heavy[0]]] + bins
-        if cost < best_cost:
-            best_cost = cost
-            best = bins
-
-    if best_spec is not None and 1 < best_spec[1] < len(ordered) <= 22:
-        k = best_spec[1]
-        cur_max = max(sum(ms_by_id[t] for t in b) for b in best)
-        ex_max, ex_bins = _exact_minimax_refine(ordered, k, cur_max, best)
-        if ex_max < cur_max:
-            best = ex_bins
-
     return best
 
-
-
-import importlib.abc
-import importlib.util
-import io
-import os
-import unittest
-
-HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-FORK_MAX_TEST_MS = 1200
-FORK_OVERHEAD_MS = 220
-FORK_MIN_GAIN_MS = 500
-
-
-def _find_sqlglot_src() -> Path | None:
-    for cand in (Path("/app/sqlglot_src"), Path(".sqlglot_repo")):
-        if (cand / "sqlglot" / "__init__.py").exists() and (cand / "tests").is_dir():
-            return cand.resolve()
-    return None
-
-
-def _apply_patch_strict(patch_text: str, src_root: Path) -> dict[str, str] | None:
-    overlay: dict[str, str] = {}
-    cur_file: str | None = None
-    hunks: list[tuple[int, int, list[str], list[str]]] = []
-
-    def flush() -> bool:
-        if cur_file is None or not hunks:
-            return True
-        if not (cur_file.startswith(("sqlglot/", "tests/")) and cur_file.endswith(".py")):
-            return False
-        target_path = src_root / cur_file
-        if not target_path.is_file():
-            return False
-        orig_lines = target_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        out: list[str] = []
-        idx = 0
-        for old_start, old_len, old_ctx, new_ctx in hunks:
-            target = max(0, old_start - 1)
-            if target < idx or target + old_len > len(orig_lines):
-                return False
-            actual = [ln.rstrip("\r\n") for ln in orig_lines[target : target + old_len]]
-            expected = [ln.rstrip("\r\n") for ln in old_ctx]
-            if actual != expected:
-                return False
-            out.extend(orig_lines[idx:target])
-            out.extend(new_ctx)
-            idx = target + old_len
-        out.extend(orig_lines[idx:])
-        overlay[cur_file] = "".join(out)
-        return True
-
-    cur_hunk: tuple[int, int, list[str], list[str]] | None = None
-    for raw in patch_text.splitlines(keepends=True):
-        if raw.startswith("--- "):
-            if not flush():
-                return None
-            cur_file = None
-            hunks = []
-            cur_hunk = None
-        elif raw.startswith("+++ "):
-            path = raw[4:].strip()
-            if path.startswith("b/"):
-                path = path[2:]
-            if path == "/dev/null":
-                return None
-            cur_file = path
-        elif raw.startswith("@@ "):
-            m = HUNK_HEADER_RE.match(raw)
-            if not m:
-                return None
-            os_ = int(m.group(1))
-            ol_ = int(m.group(2)) if m.group(2) is not None else 1
-            cur_hunk = (os_, ol_, [], [])
-            hunks.append(cur_hunk)
-        elif cur_hunk is not None and raw[:1] in (" ", "+", "-"):
-            ch = raw[0]
-            body = raw[1:]
-            if ch in (" ", "-"):
-                cur_hunk[2].append(body)
-            if ch in (" ", "+"):
-                cur_hunk[3].append(body)
-    if not flush():
-        return None
-    return overlay
-
-
-class _OverlayLoader(importlib.abc.SourceLoader):
-    def __init__(self, origin: str, data: bytes):
-        self._origin = origin
-        self._data = data
-
-    def get_filename(self, fullname: str) -> str:
-        return self._origin
-
-    def get_data(self, path: str) -> bytes:
-        if os.path.normpath(path) == os.path.normpath(self._origin):
-            return self._data
-        with open(path, "rb") as f:
-            return f.read()
-
-
-class _OverlayFinder(importlib.abc.MetaPathFinder):
-    def __init__(self, src_root: Path, overlay: dict[str, str]):
-        self.src_root = src_root
-        self.overlay = overlay
-
-    def find_spec(self, fullname: str, path=None, target=None):
-        if not (
-            fullname == "sqlglot"
-            or fullname.startswith("sqlglot.")
-            or fullname == "tests"
-            or fullname.startswith("tests.")
-        ):
-            return None
-        rel_base = fullname.replace(".", "/")
-        for rel, is_pkg in ((f"{rel_base}/__init__.py", True), (f"{rel_base}.py", False)):
-            src = self.overlay.get(rel)
-            if src is not None:
-                origin = str(self.src_root / rel)
-                loader = _OverlayLoader(origin, src.encode("utf-8"))
-                spec = importlib.util.spec_from_loader(fullname, loader, origin=origin, is_package=is_pkg)
-                if spec is not None:
-                    spec.has_location = True
-                if spec is not None and is_pkg:
-                    spec.submodule_search_locations = [str((self.src_root / rel).parent)]
-                return spec
-        return None
-
-
-def _run_forked_subset(
-    src_root: Path,
-    overlay: dict[str, str],
-    candidates: list[tuple[int, str]],
-) -> set[int]:
-    all_tids = {tid for tid, _ in candidates}
-    if not hasattr(os, "fork"):
-        return all_tids
-    r_fd, w_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(r_fd)
-        failed: list[int] = []
-        try:
-            os.chdir(src_root)
-            sys.path.insert(0, str(src_root))
-            sys.meta_path.insert(0, _OverlayFinder(src_root, overlay))
-            sys.stdout = io.StringIO()
-            sys.stderr = io.StringIO()
-            loader = unittest.defaultTestLoader
-            for tid, nid in candidates:
-                parts = nid.split("::")
-                qual = ".".join([parts[0][:-3].replace("/", ".")] + parts[1:])
-                try:
-                    suite = loader.loadTestsFromName(qual)
-                    res = unittest.TestResult()
-                    suite.run(res)
-                    if res.failures or res.errors:
-                        failed.append(tid)
-                except Exception:
-                    failed.append(tid)
-        except Exception:
-            failed = [tid for tid, _ in candidates]
-        try:
-            os.write(w_fd, json.dumps(failed).encode("utf-8"))
-        finally:
-            os.close(w_fd)
-            os._exit(0)
-
-    os.close(w_fd)
-    chunks: list[bytes] = []
-    try:
-        while True:
-            buf = os.read(r_fd, 4096)
-            if not buf:
-                break
-            chunks.append(buf)
-    finally:
-        os.close(r_fd)
-        os.waitpid(pid, 0)
-    if not chunks:
-        return all_tids
-    try:
-        return set(json.loads(b"".join(chunks).decode("utf-8")))
-    except Exception:
-        return all_tids
-
-
-def _exact_minimax_refine(ordered: list[tuple[int, int]], k: int, ub_max: int, ub_bins: list[list[int]]) -> tuple[int, list[list[int]]]:
-    n = len(ordered)
-    if k <= 1 or n > 22 or k >= n:
-        return ub_max, ub_bins
-    total = sum(ms for _, ms in ordered)
-    lb = max(ordered[0][1], (total + k - 1) // k)
-    if ub_max <= lb:
-        return ub_max, ub_bins
-
-    suffix = [0] * (n + 1)
-    for i in range(n - 1, -1, -1):
-        suffix[i] = suffix[i + 1] + ordered[i][1]
-
-    best_max = ub_max
-    best_assign: list[int] | None = None
-    loads = [0] * k
-    assign = [0] * n
-    nodes = 0
-    node_limit = 4000
-
-    def dfs(idx: int, cur_max: int) -> None:
-        nonlocal best_max, best_assign, nodes
-        if cur_max >= best_max:
-            return
-        if idx == n:
-            best_max = cur_max
-            best_assign = assign.copy()
-            return
-        nodes += 1
-        if nodes > node_limit:
-            return
-        tid, ms = ordered[idx]
-        seen_loads: set[int] = set()
-        for b in range(k):
-            ld = loads[b]
-            if ld in seen_loads:
-                continue
-            nl = ld + ms
-            if nl >= best_max:
-                continue
-            seen_loads.add(ld)
-            loads[b] = nl
-            assign[idx] = b
-            dfs(idx + 1, nl if nl > cur_max else cur_max)
-            loads[b] = ld
-            if best_max <= lb or nodes > node_limit:
-                return
-
-    dfs(0, 0)
-    if best_assign is None:
-        return ub_max, ub_bins
-    bins: list[list[int]] = [[] for _ in range(k)]
-    for idx, b in enumerate(best_assign):
-        bins[b].append(ordered[idx][0])
-    return best_max, [b for b in bins if b]
 
 
 def resolve_data_dir(cli: Path | None) -> Path:
@@ -1354,14 +1100,6 @@ def main() -> None:
             if runtime_tid is not None:
                 sample_to_runtime[int(tid_str)] = runtime_tid
 
-    sqlglot_src = _find_sqlglot_src() if hasattr(os, "fork") else None
-    if sqlglot_src is not None:
-        for _pkg in ("duckdb", "dateutil", "dateutil.parser", "pytz", "typing_extensions"):
-            try:
-                __import__(_pkg)
-            except Exception:
-                pass
-
     def _plan_cost_ms(items: list[tuple[int, int]]) -> int:
         if not items:
             return 0
@@ -1384,28 +1122,6 @@ def main() -> None:
                 ]
                 if not translated and selected:
                     translated = _all_tests_selection(all_tests)
-
-                if translated and sqlglot_src is not None:
-                    fast = [
-                        (tid, ms)
-                        for tid, ms in translated
-                        if ms <= FORK_MAX_TEST_MS and not runtime_nodeid[tid].endswith(MEMORY_TEST_SUFFIX)
-                    ]
-                    if fast:
-                        fast_set = {tid for tid, _ in fast}
-                        rem = [(tid, ms) for tid, ms in translated if tid not in fast_set]
-                        est_cpu_ms = sum(ms for _, ms in fast) + FORK_OVERHEAD_MS
-                        gain_ms = _plan_cost_ms(translated) - _plan_cost_ms(rem) - est_cpu_ms
-                        if gain_ms > FORK_MIN_GAIN_MS:
-                            overlay = _apply_patch_strict(text, sqlglot_src)
-                            if overlay is not None:
-                                failed_fast = _run_forked_subset(
-                                    sqlglot_src,
-                                    overlay,
-                                    [(tid, runtime_nodeid[tid]) for tid, _ in fast],
-                                )
-                                keep_set = {tid for tid, _ in rem} | failed_fast
-                                translated = [(tid, ms) for tid, ms in translated if tid in keep_set]
 
             workers = optimize_workers(translated, max_workers=8)
         except Exception as exc:
