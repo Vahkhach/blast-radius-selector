@@ -7,9 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY selector.py /app/selector.py
-COPY coverage_map.json.gz /app/coverage_map.json.gz
+COPY coverage_map.pkl.gz /app/coverage_map.pkl.gz
 
-RUN chmod 0644 /app/selector.py /app/coverage_map.json.gz
+RUN chmod 0644 /app/selector.py /app/coverage_map.pkl.gz
 
 # The scorer runs the container as uid 65534 with a read-only root FS.
 USER nobody

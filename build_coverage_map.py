@@ -15,8 +15,10 @@ import ast
 import gzip
 import json
 import os
+import pickle
+import posixpath
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from coverage import CoverageData
@@ -32,6 +34,8 @@ POOL_TEST_MARKERS = ("ProcessPoolExecutor", "multiprocessing", "get_context(")
 SERIALIZATION_PREFIXES = ("sqlglot/serde.py", "sqlglot/expressions/")
 PICKLE_HOOKS = {"__reduce__", "__reduce_ex__", "__getstate__", "__setstate__", "__deepcopy__", "__copy__"}
 DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+FIXTURE_ROOT = "tests/fixtures/"
+FIXTURE_SUFFIXES = (".sql", ".json", ".csv", ".csv.gz", ".txt", ".gz")
 BASE_MODULE_STEMS = {
     "dialect", "parser", "generator", "tokens", "tokenizer_core", "base", "__init__",
     "helpers", "serde", "typing", "expressions",
@@ -327,6 +331,125 @@ def _test_method_spans(rel: str, path: Path) -> list[tuple[int, int, str]]:
     return spans
 
 
+def build_fixture_index(
+    file_to_tests: dict[str, list[int]], base_to_nums: dict[str, list[int]]
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """Map fixture files and fixture directories to the tests that read them.
+
+    Test methods are identified from their source spans; directory-level reads
+    (e.g. the TPC table setup in a ``setUpClass``) attach to every test in the
+    owning file, because the directory is read before any individual test.
+    """
+    tests_for_file: dict[str, set[int]] = defaultdict(set)
+    tests_for_dir: dict[str, set[int]] = defaultdict(set)
+
+    def owner_tids(rel: str, line: int, spans: list[tuple[int, int, str]]) -> set[int]:
+        owner = None
+        for start, end, prefix in spans:
+            if start <= line <= end and (owner is None or end - start < owner[1] - owner[0]):
+                owner = (start, end, prefix)
+        if owner is not None:
+            nums = base_to_nums.get(owner[2])
+            if nums:
+                return set(nums)
+        return set(file_to_tests.get(rel, ()))
+
+    def add_path(candidate: str, tids: set[int]) -> None:
+        candidate = posixpath.normpath(candidate.replace("\\", "/"))
+        if not candidate.startswith(FIXTURE_ROOT) or candidate.startswith(".."):
+            return
+        path = REPO / candidate
+        if path.is_file():
+            tests_for_file[candidate].update(tids)
+        elif path.is_dir():
+            tests_for_dir[candidate.rstrip("/") + "/"].update(tids)
+
+    for path in sorted((REPO / "tests").rglob("*.py")):
+        rel = path.relative_to(REPO).as_posix()
+        if rel not in file_to_tests:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):
+            continue
+        spans = _test_method_spans(rel, path)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            value = node.value.strip()
+            if not value or len(value) > 240 or set(value) <= {".", "/", " ", "\\"}:
+                continue
+            line = getattr(node, "lineno", 0)
+            tids = owner_tids(rel, line, spans)
+            if not tids:
+                continue
+            if value.startswith(FIXTURE_ROOT):
+                add_path(value, tids)
+            elif not value.startswith(("/", "http:", "https:")):
+                for candidate in (
+                    FIXTURE_ROOT + value,
+                    FIXTURE_ROOT + "optimizer/" + value,
+                    FIXTURE_ROOT + "jsonpath/" + value,
+                ):
+                    add_path(candidate, tids)
+
+        # check_file("optimizer", ...) loads optimizer/<name>.sql via a
+        # formatted helper call, so the fixture name is not a path literal.
+        for m in re.finditer(r"check_file\(\s*[\"']([A-Za-z0-9_./-]+)[\"']", text):
+            value = m.group(1)
+            line = text.count("\n", 0, m.start()) + 1
+            tids = owner_tids(rel, line, spans)
+            if not tids:
+                continue
+            for candidate in (
+                FIXTURE_ROOT + "optimizer/" + value + ".sql",
+                FIXTURE_ROOT + value + ".sql",
+            ):
+                add_path(candidate, tids)
+
+        for m in re.finditer(r"FIXTURES_DIR\s*\+\s*[\"']([^\"']+)[\"']", text):
+            value = m.group(1)
+            line = text.count("\n", 0, m.start()) + 1
+            tids = owner_tids(rel, line, spans)
+            if tids:
+                add_path(FIXTURE_ROOT + value.lstrip("/"), tids)
+
+    fixtures: dict[str, list[int]] = {
+        rel: sorted(tids) for rel, tids in tests_for_file.items() if tids
+    }
+    fixture_root = REPO / FIXTURE_ROOT
+    real_dirs = {FIXTURE_ROOT}
+    if fixture_root.exists():
+        for path in fixture_root.rglob("*"):
+            if path.is_dir():
+                real_dirs.add(path.relative_to(REPO).as_posix() + "/")
+    # Windows trims trailing dots/spaces per component, so string paths such as
+    # "tests/fixtures/...... ......./" resolve to the fixture root. Only keep
+    # directories that actually exist in the checkout.
+    fixture_dirs: dict[str, list[int]] = {
+        prefix: sorted(tids)
+        for prefix, tids in tests_for_dir.items()
+        if tids and prefix in real_dirs
+    }
+
+    if fixture_root.exists():
+        for path in sorted(fixture_root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(REPO).as_posix()
+            if rel in fixtures:
+                continue
+            best_prefix = None
+            for prefix, tids in fixture_dirs.items():
+                if rel.startswith(prefix) and (best_prefix is None or len(prefix) > len(best_prefix[0])):
+                    best_prefix = (prefix, tids)
+            if best_prefix is not None:
+                fixtures[rel] = list(best_prefix[1])
+    return fixtures, fixture_dirs
+
+
 def build_dialect_indexes(
     idx: dict,
     file_to_tests: dict[str, list[int]],
@@ -363,6 +486,26 @@ def build_dialect_indexes(
                     queue.append(nxt)
         if out:
             dialects[rel] = sorted(out)
+
+    # Parser/generator/typing modules are split out of the dialect classes.
+    # Bind every such file to its dialect family (its own stem plus descendant
+    # dialects of the matching sqlglot/dialects/<stem>.py class).
+    module_files: set[str] = set()
+    for prefix in DIALECT_DIRS:
+        base = REPO / prefix
+        if not base.exists():
+            continue
+        module_files.update(
+            path.relative_to(REPO).as_posix() for path in base.glob("*.py")
+        )
+    for rel in sorted(module_files):
+        stem = Path(rel).stem
+        if stem in BASE_MODULE_STEMS:
+            continue
+        family = {stem}
+        family.update(dialects.get(f"sqlglot/dialects/{stem}.py", ()))
+        family.update(dialects.get(rel, ()))
+        dialects[rel] = sorted(family)
 
     dialect_tests: dict[str, list[int]] = {}
     known_stems = {s for ss in dialects.values() for s in ss}
@@ -413,8 +556,9 @@ def build_dialect_indexes(
         }
         tokens = set(re.split(r"[^a-z0-9_]+", rel.lower()))
         for stem in markers:
-            if len(markers) == 1 or stem in tokens:
-                fixture_dialects[stem].add(rel)
+            # A fixture that exercises several dialects belongs to every one
+            # of them: a dialect-specific regression makes that whole test fail.
+            fixture_dialects[stem].add(rel)
         for stem in known_stems & tokens:
             fixture_dialects[stem].add(rel)
     fixture_dialect_tests: dict[str, list[int]] = {}
@@ -546,6 +690,87 @@ def introspection_tests(
                     continue
             out.update(file_to_tests[rel])
     return sorted(out)
+
+
+def build_compact_core(
+    tests: list[dict],
+    hits: dict[str, dict[int, set[int]]],
+    file_to_tests: dict[str, list[int]],
+    memory_tid: int | None,
+    limit: int = 150,
+) -> list[int]:
+    """A small import/API/transpile smoke set that still touches every module.
+
+    One representative test per module and per test/dialect file catches import
+    errors, registration mistakes and basic transpilation without dragging in
+    the multi-second executor and memory tests.
+    """
+    seconds = {int(t["number"]): float(t["seconds"]) for t in tests}
+    nodeids = {
+        int(t["number"]): str(t["id"]).replace("\\", "/") for t in tests
+    }
+    chosen: list[int] = []
+    chosen_set: set[int] = set()
+
+    def add(tid: int) -> None:
+        if tid == memory_tid or tid in chosen_set or tid not in seconds:
+            return
+        chosen_set.add(tid)
+        chosen.append(tid)
+
+    mandatory = (
+        "tests/test_dialect_imports.py",
+        "tests/test_dialect_entry_points.py",
+        "tests/test_build.py",
+        "tests/test_transpile.py",
+    )
+    for name in mandatory:
+        for tid in file_to_tests.get(name, ()):
+            add(tid)
+
+    # One cheap representative per test file and per dialect file.
+    for rel, tids in sorted(file_to_tests.items()):
+        if not rel.endswith(".py"):
+            continue
+        candidates = [tid for tid in tids if tid != memory_tid and seconds.get(tid, 0.0) <= 2.0]
+        if candidates:
+            add(min(candidates, key=lambda tid: (seconds[tid], tid)))
+
+    # One test per covered module, preferring broad line coverage and low cost.
+    core_first = (
+        "sqlglot/parser.py",
+        "sqlglot/generator.py",
+        "sqlglot/tokens.py",
+        "sqlglot/expressions/",
+        "sqlglot/optimizer/",
+        "sqlglot/dialects/dialect.py",
+    )
+
+    def module_priority(rel: str) -> tuple[int, str]:
+        if rel.startswith(core_first) or rel in core_first:
+            return (0, rel)
+        if rel.startswith(("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/schema.py")):
+            return (1, rel)
+        return (2, rel)
+
+    for rel in sorted(hits, key=module_priority):
+        counts: Counter[int] = Counter()
+        for tids in hits[rel].values():
+            for tid in tids:
+                if tid != memory_tid:
+                    counts[tid] += 1
+        candidates = [
+            (count, seconds.get(tid, 0.0), tid) for tid, count in counts.items()
+        ]
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        for _, cost, tid in candidates:
+            if cost <= 2.0 or not any(seconds[c[2]] <= 2.0 for c in candidates):
+                add(tid)
+                break
+        if len(chosen) >= limit:
+            break
+
+    return sorted(chosen[:limit])
 
 
 def main() -> None:
@@ -708,24 +933,7 @@ def main() -> None:
             if tids:
                 class_ref_groups[rel][name] = gid(tids)
 
-    fixtures: dict[str, list[int]] = {}
-    for candidate in (
-        ROOT / "_exp" / "coverage_map_v1.json.gz",
-        ROOT / "_exp" / "coverage_map_v2.json.gz",
-        out_path,
-    ):
-        if not candidate.exists():
-            continue
-        try:
-            old = json.loads(gzip.decompress(candidate.read_bytes()).decode("utf-8"))
-        except Exception:
-            continue
-        for key, tids in old.get("fixtures", {}).items():
-            if not tids or not (REPO / key).exists():
-                continue
-            fixtures[key] = sorted(set(tids))
-        if fixtures:
-            break
+    fixtures, fixture_dirs = build_fixture_index(file_to_tests, base_to_nums)
 
     dialect_idx = build_dialect_indexes(idx, file_to_tests, base_to_nums, fixtures)
     all_anchor_keys = {k for per_file in anchors.values() for k, _ in per_file}
@@ -734,32 +942,18 @@ def main() -> None:
     pools = pool_tests(file_to_tests)
     intro = introspection_tests(file_to_tests, base_to_nums)
 
-    def module_union(rels: tuple[str, ...]) -> set[int]:
-        out: set[int] = set()
-        for rel in rels:
-            for line_tids in hits.get(rel, {}).values():
-                out |= line_tids
-        return out
-
-    core_rels = (
-        "sqlglot/parser.py",
-        "sqlglot/generator.py",
-        "sqlglot/tokens.py",
-        "sqlglot/__init__.py",
-        "sqlglot/dialects/dialect.py",
-        "sqlglot/optimizer/optimizer.py",
-    )
-    core = module_union(core_rels)
-    for rel in hits:
-        if rel.startswith("sqlglot/expressions/"):
-            core |= module_union((rel,))
-    executor_tids = set(file_to_tests.get("tests/test_executor.py", ()))
-    core -= executor_tids
-    if memory_tid is not None:
-        core.discard(memory_tid)
-    dialect_core = module_union(("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py"))
-    if memory_tid is not None:
-        dialect_core.discard(memory_tid)
+    core = build_compact_core(tests, hits, file_to_tests, memory_tid)
+    nodeids = {int(t["number"]): str(t["id"]).replace("\\", "/") for t in tests}
+    dialect_core = [
+        tid for tid in core
+        if nodeids[tid].startswith((
+            "tests/dialects/",
+            "tests/test_transpile.py",
+            "tests/test_dialect_imports.py",
+            "tests/test_dialect_entry_points.py",
+            "tests/test_build.py",
+        ))
+    ]
 
     payload = {
         "pinned_commit": PINNED_COMMIT,
@@ -775,11 +969,12 @@ def main() -> None:
         "doc_spans": doc_spans,
         "pickle_spans": idx["pickle_spans"],
         "file_to_tests": file_to_tests,
-        "id_by_tid": {str(t["number"]): str(t["id"]).replace("\\", "/") for t in tests},
+        "id_by_tid": {str(num): nid for num, nid in nodeids.items()},
         "importers": importers,
         "pool_tests": pools,
         "introspection_tests": intro,
         "fixtures": fixtures,
+        "fixture_dirs": fixture_dirs,
         "dialects": dialect_idx["dialects"],
         "dialect_tests": dialect_idx["dialect_tests"],
         "fixture_dialect_tests": dialect_idx["fixture_dialect_tests"],
@@ -792,6 +987,10 @@ def main() -> None:
     }
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     out_path.write_bytes(gzip.compress(raw, compresslevel=9))
+    pkl_path = out_path.with_name(out_path.name.replace(".json.gz", ".pkl.gz"))
+    if pkl_path == out_path:
+        pkl_path = out_path.with_suffix(".pkl.gz")
+    pkl_path.write_bytes(gzip.compress(pickle.dumps(payload, protocol=5), compresslevel=9))
 
     covered = sum(len(v) for v in hits.values())
     print(
@@ -799,9 +998,11 @@ def main() -> None:
         f"stmt_spans={sum(len(v) for v in stmt_groups.values())} "
         f"anchors={sum(len(v) for v in anchor_groups.values())} "
         f"keywords={len(keyword_tests)} dialects={len(dialect_idx['dialect_tests'])} "
-        f"fixtures={len(fixtures)} pool_tests={len(pools)} intro={len(intro)} "
+        f"fixtures={len(fixtures)} fixture_dirs={len(fixture_dirs)} "
+        f"pool_tests={len(pools)} intro={len(intro)} "
         f"core={len(core)} dialect_core={len(dialect_core)} "
-        f"raw={len(raw) / 1e6:.1f}MB gz={out_path.stat().st_size / 1e6:.2f}MB"
+        f"raw={len(raw) / 1e6:.1f}MB gz={out_path.stat().st_size / 1e6:.2f}MB "
+        f"pkl={pkl_path.stat().st_size / 1e6:.2f}MB"
     )
 
 

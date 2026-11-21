@@ -11,10 +11,10 @@ tests.json still selects the right tests.
 from __future__ import annotations
 
 import argparse
-import difflib
 import gzip
 import json
 import math
+import pickle
 import re
 import sys
 from pathlib import Path
@@ -26,18 +26,41 @@ SIG_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+")
 DECORATOR_RE = re.compile(r"^\s*@")
 IMPORT_RE = re.compile(r"^\s*(?:from\s+\S+\s+import|import\s+)")
 GLOBAL_RE = re.compile(r"^\s*(?:global|nonlocal)\s+")
-IS_RE = re.compile(r"\bis(?:\s+not)?\s+([A-Za-z_][\w.]*)")
-EQ_RE = re.compile(r"==|!=")
-STRING_TRIVIAL_RE = re.compile(r"^[rRbBuU]{0,2}(\"\"\"|''')")
+COMMENT_RE = re.compile(r"^\s*#")
 
 COST_PER_WORKER = 2000
 MEMORY_TEST_SUFFIX = "::test_generator_memory"
 SMALL_ANCHOR_LIMIT = 120
 SPAN_ANCHOR_LIMIT = 20
 CLASS_REF_LIMIT = 400
+SMALL_SET_MS = 1500
 
-DIALECT_DIR = "sqlglot/dialects/"
+DIALECT_PREFIXES = (
+    "sqlglot/dialects/",
+    "sqlglot/parsers/",
+    "sqlglot/generators/",
+    "sqlglot/typing/",
+)
 OPTIMIZER_FILE = "tests/test_optimizer.py"
+EXECUTOR_FILE = "tests/test_executor.py"
+LINEAGE_FILE = "tests/test_lineage.py"
+DIALECT_TEST_FILE = "tests/dialects/test_dialect.py"
+TRANSPILE_FILE = "tests/test_transpile.py"
+FIXTURE_ROOT = "tests/fixtures/"
+CORE_DYNAMIC_PREFIXES = (
+    "sqlglot/optimizer/",
+    "sqlglot/executor/",
+    "sqlglot/expressions/",
+)
+CORE_DYNAMIC_FILES = {
+    "sqlglot/parser.py",
+    "sqlglot/generator.py",
+    "sqlglot/planner.py",
+    "sqlglot/schema.py",
+    "sqlglot/serde.py",
+    "sqlglot/tokens.py",
+    "sqlglot/transforms.py",
+}
 
 
 def load_tests(tests_path: Path) -> list[tuple[int, str, str, int]]:
@@ -57,7 +80,10 @@ def load_tests(tests_path: Path) -> list[tuple[int, str, str, int]]:
 
 
 def load_map(path: Path) -> dict:
-    return json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
+    payload = gzip.decompress(path.read_bytes())
+    if path.name.endswith(".pkl.gz") or path.suffix == ".pkl":
+        return pickle.loads(payload)
+    return json.loads(payload.decode("utf-8"))
 
 
 class Change:
@@ -89,50 +115,15 @@ def _norm_path(raw: str) -> str | None:
     return raw.replace("\\", "/")
 
 
-def _canon(text: str) -> str:
-    t = text.strip()
-    t = re.sub(r"\bis\s+not\b", "!=", t)
-    t = re.sub(r"\bis\b", "==", t)
-    return re.sub(r"\s+", " ", t)
+def _blank(text: str) -> bool:
+    return not text.strip()
 
 
-def _allowed_rhs(text: str, enums: set[str]) -> bool:
-    m = IS_RE.search(text)
-    if not m:
-        return False
-    value = m.group(1)
-    if value in ("None", "True", "False"):
-        return True
-    head, _, member = value.partition(".")
-    return bool(member) and head in enums
+def _comment(text: str) -> bool:
+    return bool(COMMENT_RE.match(text))
 
 
-def _equivalent(a: str, b: str, enums: set[str]) -> bool:
-    ca, cb = _canon(a), _canon(b)
-    if ca != cb:
-        return False
-    if a.strip() == b.strip():
-        return True
-    if ("==" in ca or "!=" in ca) and (_allowed_rhs(a, enums) or _allowed_rhs(b, enums)):
-        return True
-    return False
-
-
-def _trivial(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped or stripped.startswith("#"):
-        return True
-    if stripped in ("pass", "..."):
-        return True
-    m = STRING_TRIVIAL_RE.match(stripped)
-    if m:
-        quote = m.group(1)
-        if stripped.count(quote) % 2 == 0:
-            return True
-    return False
-
-
-def parse_patch(text: str, enums: set[str]) -> tuple[list[PatchFile], bool]:
+def parse_patch(text: str) -> tuple[list[PatchFile], bool]:
     files: list[PatchFile] = []
     cur: PatchFile | None = None
     old_line = 0
@@ -144,30 +135,13 @@ def parse_patch(text: str, enums: set[str]) -> tuple[list[PatchFile], bool]:
 
     def flush_block() -> None:
         nonlocal minus, plus, block_anchor
-        if cur is None or (not minus and not plus):
+        if cur is None:
             minus, plus, block_anchor = [], [], None
             return
-        # Align removed/added lines by canonical text, then drop pairs that are
-        # provably equivalent (`is None` -> `== None` and enum comparisons).
-        ca = [_canon(t) for _, t in minus]
-        cb = [_canon(t) for _, t in plus]
-        skip_m: set[int] = set()
-        skip_p: set[int] = set()
-        if ca and cb:
-            matcher = difflib.SequenceMatcher(a=ca, b=cb, autojunk=False)
-            for block in matcher.get_matching_blocks():
-                for k in range(block.size):
-                    mi = block.a + k
-                    pi = block.b + k
-                    if _equivalent(minus[mi][1], plus[pi][1], enums):
-                        skip_m.add(mi)
-                        skip_p.add(pi)
-        for i, (pos, t) in enumerate(minus):
-            if i not in skip_m:
-                cur.changes.append(Change(pos, t))
-        for i, (pos, t) in enumerate(plus):
-            if i not in skip_p:
-                cur.changes.append(Change(pos, t))
+        for pos, line_text in minus:
+            cur.changes.append(Change(pos, line_text))
+        for pos, line_text in plus:
+            cur.changes.append(Change(pos, line_text))
         minus, plus, block_anchor = [], [], None
 
     for line in text.splitlines():
@@ -206,7 +180,7 @@ def parse_patch(text: str, enums: set[str]) -> tuple[list[PatchFile], bool]:
             new_line += 1
         elif tag == "-":
             content = line[1:]
-            if not _trivial(content):
+            if not _blank(content) and not _comment(content):
                 cur.trivial_only = False
             if block_anchor is None:
                 block_anchor = old_line
@@ -214,7 +188,7 @@ def parse_patch(text: str, enums: set[str]) -> tuple[list[PatchFile], bool]:
             old_line += 1
         elif tag == "+":
             content = line[1:]
-            if not _trivial(content):
+            if not _blank(content) and not _comment(content):
                 cur.trivial_only = False
             if block_anchor is not None:
                 pos = block_anchor
@@ -276,6 +250,55 @@ def _anchors_for_line(text: str) -> list[str]:
     return keys
 
 
+def _prepare(cmap: dict) -> dict:
+    prepared = cmap.get("_prepared")
+    if prepared is not None:
+        return prepared
+    prepared = {
+        "groups": cmap["groups"],
+        "line_runs": cmap["line_runs"],
+        "scope_groups": cmap["scope_groups"],
+        "stmt_groups": cmap["stmt_groups"],
+        "module_groups": cmap["module_groups"],
+        "anchor_groups": cmap["anchor_groups"],
+        "anchor_spans": cmap.get("anchor_spans", {}),
+        "class_spans": cmap.get("class_spans", {}),
+        "class_ref_groups": cmap.get("class_ref_groups", {}),
+        "pickle_spans": cmap.get("pickle_spans", {}),
+        "doc_spans": cmap.get("doc_spans", {}),
+        "dialects": cmap.get("dialects", {}),
+        "dialect_tests": {k: set(v) for k, v in cmap.get("dialect_tests", {}).items()},
+        "fixture_dialect_tests": {
+            k: set(v) for k, v in cmap.get("fixture_dialect_tests", {}).items()
+        },
+        "keyword_tests": {k: set(v) for k, v in cmap.get("keyword_tests", {}).items()},
+        "file_to_tests": {k: set(v) for k, v in cmap["file_to_tests"].items()},
+        "importers": cmap["importers"],
+        "pool_tests": set(cmap["pool_tests"]),
+        "introspection": set(cmap.get("introspection_tests", ())),
+        "core_tests": set(cmap.get("core_tests", ())),
+        "dialect_core_tests": set(cmap.get("dialect_core_tests", ())),
+        "fixtures": {k: set(v) for k, v in cmap["fixtures"].items()},
+        "fixture_dirs": {k: set(v) for k, v in cmap.get("fixture_dirs", {}).items()},
+        "sample_ids": {int(tid) for tid in cmap.get("id_by_tid", {})},
+        "nodeids": cmap.get("id_by_tid", {}),
+    }
+    prepared["memory_tids"] = {
+        int(tid) for tid, nodeid in prepared["nodeids"].items()
+        if nodeid.endswith(MEMORY_TEST_SUFFIX)
+    }
+    if cmap.get("memory_test") is not None:
+        prepared["memory_tids"].add(int(cmap["memory_test"]))
+    prepared["serialization_prefixes"] = tuple(cmap.get("serialization_prefixes", ()))
+    method_tids: dict[str, set[int]] = {}
+    for tid_str, nodeid in prepared["nodeids"].items():
+        name = nodeid.split("::")[-1].split("[", 1)[0]
+        method_tids.setdefault(name, set()).add(int(tid_str))
+    prepared["method_tids"] = method_tids
+    cmap["_prepared"] = prepared
+    return prepared
+
+
 def select_tests(
     patch_text: str,
     all_tests: list[tuple[int, str, str, int]],
@@ -283,39 +306,36 @@ def select_tests(
 ) -> list[tuple[int, int]]:
     if not patch_text.strip():
         return []
-    enums = set(cmap.get("enum_classes", ()))
-    files, had = parse_patch(patch_text, enums)
+    files, had = parse_patch(patch_text)
+    prep = _prepare(cmap)
 
-    groups: list[list[int]] = cmap["groups"]
-    line_runs = cmap["line_runs"]
-    scope_groups = cmap["scope_groups"]
-    stmt_groups = cmap["stmt_groups"]
-    module_groups = cmap["module_groups"]
-    anchor_groups = cmap["anchor_groups"]
-    anchor_spans = cmap.get("anchor_spans", {})
-    class_spans = cmap.get("class_spans", {})
-    class_ref_groups = cmap.get("class_ref_groups", {})
-    pickle_spans = cmap.get("pickle_spans", {})
-    doc_spans = cmap.get("doc_spans", {})
-    dialects = cmap.get("dialects", {})
-    dialect_tests = {k: set(v) for k, v in cmap.get("dialect_tests", {}).items()}
-    fixture_dialect_tests = {k: set(v) for k, v in cmap.get("fixture_dialect_tests", {}).items()}
-    keyword_tests = {k: set(v) for k, v in cmap.get("keyword_tests", {}).items()}
-    file_to_tests = {k: set(v) for k, v in cmap["file_to_tests"].items()}
-    importers = cmap["importers"]
-    pool_tests = set(cmap["pool_tests"])
-    introspection = set(cmap.get("introspection_tests", ()))
-    core_tests = set(cmap.get("core_tests", ()))
-    dialect_core_tests = set(cmap.get("dialect_core_tests", ()))
-    fixtures = {k: set(v) for k, v in cmap["fixtures"].items()}
-    sample_ids = {int(tid) for tid in cmap.get("id_by_tid", {})}
-    memory_tids = {
-        int(tid) for tid, nodeid in cmap.get("id_by_tid", {}).items()
-        if nodeid.endswith(MEMORY_TEST_SUFFIX)
-    }
-    if cmap.get("memory_test") is not None:
-        memory_tids.add(int(cmap["memory_test"]))
-    serialization_prefixes = tuple(cmap.get("serialization_prefixes", ()))
+    groups: list[list[int]] = prep["groups"]
+    line_runs = prep["line_runs"]
+    scope_groups = prep["scope_groups"]
+    stmt_groups = prep["stmt_groups"]
+    module_groups = prep["module_groups"]
+    anchor_groups = prep["anchor_groups"]
+    anchor_spans = prep["anchor_spans"]
+    class_spans = prep["class_spans"]
+    class_ref_groups = prep["class_ref_groups"]
+    pickle_spans = prep["pickle_spans"]
+    doc_spans = prep["doc_spans"]
+    dialects = prep["dialects"]
+    dialect_tests = prep["dialect_tests"]
+    fixture_dialect_tests = prep["fixture_dialect_tests"]
+    keyword_tests = prep["keyword_tests"]
+    file_to_tests = prep["file_to_tests"]
+    importers = prep["importers"]
+    pool_tests = prep["pool_tests"]
+    introspection = prep["introspection"]
+    core_tests = prep["core_tests"]
+    dialect_core_tests = prep["dialect_core_tests"]
+    fixtures = prep["fixtures"]
+    fixture_dirs = prep["fixture_dirs"]
+    method_tids = prep["method_tids"]
+    sample_ids = prep["sample_ids"]
+    memory_tids = prep["memory_tids"]
+    serialization_prefixes = prep["serialization_prefixes"]
     all_ms = {tid: ms for tid, _, _, ms in all_tests}
     smoke = min(
         ((tid, ms) for tid, nodeid, _, ms in all_tests if not nodeid.endswith(MEMORY_TEST_SUFFIX)),
@@ -364,13 +384,35 @@ def select_tests(
         else:
             use_all = True
 
+    def is_dialect_module(rel: str) -> bool:
+        return rel.startswith(DIALECT_PREFIXES)
+
     def module_or_core(rel: str) -> None:
         if add_module(rel):
             return
-        if rel.startswith(DIALECT_DIR) and dialect_core_tests:
+        if is_dialect_module(rel) and dialect_core_tests:
             chosen.update(dialect_core_tests)
             return
         fallback_core()
+
+    def add_core_consumers(rel: str) -> None:
+        # Dynamic dispatch (Generator/Parser/Expression and the executor) is
+        # exercised through coverage groups; never drop the executor just
+        # because a changed function was only partially covered at baseline.
+        if not (rel.startswith(CORE_DYNAMIC_PREFIXES) or rel in CORE_DYNAMIC_FILES):
+            return
+        gid = module_groups.get(rel)
+        if gid is None:
+            return
+        ids = set(groups[gid])
+        for test_file, tids in file_to_tests.items():
+            if test_file == EXECUTOR_FILE or test_file.startswith("tests/dataframe/"):
+                chosen.update(ids & tids)
+
+    def add_dialect_family(rel: str) -> None:
+        for stem in dialects.get(rel, ()):
+            chosen.update(dialect_tests.get(stem, ()))
+            chosen.update(fixture_dialect_tests.get(stem, ()))
 
     def span_keys_at(rel: str, pos: int) -> set[str]:
         out: set[str] = set()
@@ -440,39 +482,59 @@ def select_tests(
         return out
 
     def handle_position(rel: str, pos: int, text: str) -> None:
-        if _trivial(text):
+        if _blank(text):
             return
-        spans = scope_groups.get(rel, [])
-        in_scope = _span_index(spans, pos)
+        if _comment(text):
+            if introspection:
+                chosen.update(introspection)
+            return
+
+        structural = (
+            bool(SIG_RE.match(text))
+            or bool(IMPORT_RE.match(text))
+            or bool(DECORATOR_RE.match(text))
+            or bool(GLOBAL_RE.match(text))
+        )
+        in_scope = _span_index(scope_groups.get(rel, []), pos)
+
         if in_scope is not None:
-            if SIG_RE.match(text) or IMPORT_RE.match(text) or DECORATOR_RE.match(text) or GLOBAL_RE.match(text):
+            if structural:
                 mod_ok = add_module(rel)
                 imp_ok = add_importers(rel)
                 cls_ok = add_ids(class_consumer_tids(rel, pos, unlimited=True))
+                add_core_consumers(rel)
                 if not (mod_ok or imp_ok or cls_ok):
                     fallback_core()
                 return
-            hits = line_tids_near(rel, pos)
-            stmt = _span_index(stmt_groups.get(rel, []), pos)
-            if hits:
-                chosen.update(hits)
-            elif stmt is not None:
-                chosen.update(groups[stmt[2]])
-            else:
-                if not add_scope_near(rel, pos):
-                    module_or_core(rel)
-            if stmt is not None:
-                chosen.update(groups[stmt[2]])
+            # Any edit inside a function invalidates every path through that
+            # function, not just the tests that happened to execute this line.
+            # The full scope group and the exact line runs are the coverage
+            # evidence for the function; widening to the module would pull in
+            # every test that touches any other function in the file.
+            span = _span_index(scope_groups.get(rel, []), pos)
+            line_ids = line_tids_near(rel, pos)
+            if span is not None:
+                chosen.update(groups[span[2]])
+            if line_ids:
+                chosen.update(line_ids)
+            if span is None and not line_ids:
+                module_or_core(rel)
+            if is_dialect_module(rel):
+                add_dialect_family(rel)
             return
 
         if _in_spans(doc_spans.get(rel, ()), pos):
-            module_or_core(rel)
+            if not add_scope_near(rel, pos):
+                module_or_core(rel)
+            if introspection:
+                chosen.update(introspection)
             return
 
-        if SIG_RE.match(text) or IMPORT_RE.match(text) or DECORATOR_RE.match(text) or GLOBAL_RE.match(text):
+        if structural:
             mod_ok = add_module(rel)
             imp_ok = add_importers(rel)
             cls_ok = add_ids(class_consumer_tids(rel, pos, unlimited=True))
+            add_core_consumers(rel)
             if not (mod_ok or imp_ok or cls_ok):
                 fallback_core()
             return
@@ -481,18 +543,12 @@ def select_tests(
         line_tids = tids_for_keys(rel, line_keys) | line_tids_near(rel, pos)
         extra = small_span_tids(rel, pos, line_keys)
 
-        stems = dialects.get(rel, [])
-        if stems:
-            dtids: set[int] = set()
-            for stem in stems:
-                dtids |= dialect_tests.get(stem, set())
-                dtids |= fixture_dialect_tests.get(stem, set())
+        if is_dialect_module(rel):
+            add_dialect_family(rel)
             if line_tids and len(line_tids) <= SMALL_ANCHOR_LIMIT:
-                dtids |= line_tids
-            dtids |= extra
-            if dtids:
-                chosen.update(dtids)
-                return
+                chosen.update(line_tids)
+            chosen.update(extra)
+            return
 
         if line_tids or extra:
             if line_keys and len(line_tids) > SMALL_ANCHOR_LIMIT:
@@ -503,25 +559,25 @@ def select_tests(
                     module_or_core(rel)
             else:
                 chosen.update(line_tids | extra)
+            add_core_consumers(rel)
             return
 
         cls_tids = class_consumer_tids(rel, pos)
         if cls_tids:
             chosen.update(cls_tids)
+            add_core_consumers(rel)
             return
         mod_ok = add_module(rel)
         imp_ok = add_importers(rel)
+        add_core_consumers(rel)
         if not (mod_ok or imp_ok):
             module_or_core(rel)
 
     def handle_comments(rel: str, f: PatchFile) -> None:
-        pure_comment = all(
-            (not ch.text.strip()) or ch.text.strip().startswith("#") for ch in f.changes
-        )
+        pure_comment = all(_blank(ch.text) or _comment(ch.text) for ch in f.changes)
         if pure_comment:
-            # Comment lines do not change bytecode. The only realistic failure
-            # mode is source/doctest introspection, so run those tests instead
-            # of a whole (possibly huge) module group.
+            # Comments do not change bytecode, but source/doctest introspection
+            # can observe them, so those tests must still run.
             if introspection:
                 chosen.update(introspection)
                 return
@@ -533,77 +589,95 @@ def select_tests(
                 if file_to_tests.get(test_file):
                     chosen.update(file_to_tests[test_file])
                     return
+            fallback_core()
             return
 
-        stem = Path(rel).stem
-        candidates: list[set[int]] = []
-        for test_file in (
-            f"tests/dialects/test_{stem}.py",
-            f"tests/test_{stem}.py",
-            f"tests/test_{stem.replace('_', '')}.py",
-        ):
-            if file_to_tests.get(test_file):
-                candidates.append(set(file_to_tests[test_file]))
-                break
-        scope_ids: set[int] = set()
         for ch in f.changes:
-            for delta in (0, -1, 1):
-                span = _span_index(scope_groups.get(rel, []), ch.pos + delta)
-                if span is not None:
-                    scope_ids.update(groups[span[2]])
-                    break
-        if scope_ids:
-            candidates.append(scope_ids)
-        if not candidates:
-            gid = module_groups.get(rel)
-            if gid is not None and groups[gid]:
-                candidates.append(set(groups[gid]))
-        if candidates:
-            chosen.update(min(candidates, key=lambda ids: sum(map_ms(t) for t in ids)))
+            handle_position(rel, ch.pos, ch.text)
         if introspection:
             chosen.update(introspection)
-        if not candidates and not introspection:
-            module_or_core(rel)
 
     def add_dialect_shared(rel: str, class_level: bool) -> None:
         gid = module_groups.get(rel)
         module_ids = set(groups[gid]) if gid is not None else set()
-        # test_transpile is small and cross-dialect: include it whole.
-        add_test_file("tests/test_transpile.py")
-        dialect_file = "tests/dialects/test_dialect.py"
-        scoped_dialect = module_ids & file_to_tests.get(dialect_file, set())
+        # A dialect change is observable anywhere that dialect is exercised.
+        # Prefer the tests that actually executed this module at baseline; the
+        # whole file is the fallback only when coverage has no evidence.
+        scoped_transpile = module_ids & file_to_tests.get(TRANSPILE_FILE, set())
+        if scoped_transpile:
+            chosen.update(scoped_transpile)
+        elif class_level:
+            add_test_file(TRANSPILE_FILE)
+        scoped_dialect = module_ids & file_to_tests.get(DIALECT_TEST_FILE, set())
         if scoped_dialect:
             chosen.update(scoped_dialect)
-        else:
-            add_test_file(dialect_file)
+        elif class_level:
+            add_test_file(DIALECT_TEST_FILE)
         scoped_opt = module_ids & file_to_tests.get(OPTIMIZER_FILE, set())
         if scoped_opt:
             chosen.update(scoped_opt)
-        elif class_level:
-            add_test_file(OPTIMIZER_FILE)
-        for stem in dialects.get(rel, []):
-            chosen.update(dialect_tests.get(stem, ()))
-            chosen.update(fixture_dialect_tests.get(stem, ()))
+        add_test_file(LINEAGE_FILE)
+        add_dialect_family(rel)
 
     def handle_missing_file(rel: str) -> None:
         stem = Path(rel).stem
-        is_dialect_file = rel.startswith(DIALECT_DIR)
+        is_dialect_file = is_dialect_module(rel)
         added = False
         for test_file in (f"tests/dialects/test_{stem}.py", f"tests/test_{stem}.py"):
             if file_to_tests.get(test_file):
                 added = add_test_file(test_file) or added
         added = add_importers(rel) or added
         if is_dialect_file:
-            added = add_test_file("tests/test_transpile.py") or added
-            added = add_test_file("tests/dialects/test_dialect.py") or added
-            for stem_name in dialects.get(rel, []):
-                added = add_ids(dialect_tests.get(stem_name, set())) or added
-                added = add_ids(fixture_dialect_tests.get(stem_name, set())) or added
+            added = add_test_file(TRANSPILE_FILE) or added
+            added = add_test_file(DIALECT_TEST_FILE) or added
+            added = add_test_file(LINEAGE_FILE) or added
+            before = len(chosen)
+            add_dialect_family(rel)
+            added = added or len(chosen) > before
         if not added:
             if is_dialect_file and dialect_core_tests:
                 chosen.update(dialect_core_tests)
             else:
                 fallback_core()
+
+    def handle_fixture(rel: str) -> bool:
+        if rel in fixtures:
+            chosen.update(fixtures[rel])
+            return True
+        matched = False
+        # Directory-level mapping (e.g. TPC tables read in setUpClass) is the
+        # only static link for files opened through a directory constant.
+        best_prefix = None
+        for prefix, tids in fixture_dirs.items():
+            if rel.startswith(prefix) and (best_prefix is None or len(prefix) > len(best_prefix[0])):
+                best_prefix = (prefix, tids)
+        if best_prefix is not None:
+            chosen.update(best_prefix[1])
+            matched = True
+        # A renamed/new fixture usually keeps the test method name.
+        name = Path(rel).stem
+        for candidate in (name, name.replace(".", "_")):
+            tids = method_tids.get("test_" + candidate)
+            if tids:
+                chosen.update(tids)
+                matched = True
+        if rel.startswith(FIXTURE_ROOT + "optimizer/tpc-"):
+            executor = file_to_tests.get(EXECUTOR_FILE, ())
+            if executor:
+                chosen.update(executor)
+                matched = True
+        if rel.startswith(FIXTURE_ROOT + "jsonpath/"):
+            jsonpath = file_to_tests.get("tests/test_jsonpath.py", ())
+            if jsonpath:
+                chosen.update(jsonpath)
+                matched = True
+        if not matched:
+            parent = rel.rsplit("/", 1)[0] + "/"
+            for prefix, tids in fixture_dirs.items():
+                if parent.startswith(prefix) or prefix.startswith(parent):
+                    chosen.update(tids)
+                    matched = True
+        return matched
 
     for f in files:
         rel = f.new_path or f.old_path
@@ -615,42 +689,39 @@ def select_tests(
             add_importers(f.new_path)
             add_module(f.old_path)
             add_module(f.new_path)
-            if f.old_path.startswith(DIALECT_DIR) or f.new_path.startswith(DIALECT_DIR):
+            if f.old_path.startswith(FIXTURE_ROOT):
+                handle_fixture(f.old_path)
+            if f.new_path.startswith(FIXTURE_ROOT):
+                handle_fixture(f.new_path)
+            if is_dialect_module(f.old_path) or is_dialect_module(f.new_path):
                 add_dialect_shared(f.new_path, class_level=True)
             continue
 
         if f.is_new:
-            if rel.endswith(".py") and rel.startswith("sqlglot/"):
+            if rel.startswith(FIXTURE_ROOT):
+                if not handle_fixture(rel):
+                    fallback_core()
+            elif rel.endswith(".py") and rel.startswith("sqlglot/"):
                 handle_missing_file(rel)
             continue
 
         if f.is_deleted:
-            add_importers(rel)
-            add_module(rel)
-            if rel.startswith(DIALECT_DIR):
-                add_dialect_shared(rel, class_level=True)
-            if not add_module(rel):
-                handle_missing_file(rel)
+            if rel.startswith(FIXTURE_ROOT):
+                if not handle_fixture(rel):
+                    fallback_core()
+            elif rel.endswith(".py") and rel.startswith("sqlglot/"):
+                add_importers(rel)
+                add_module(rel)
+                if is_dialect_module(rel):
+                    add_dialect_shared(rel, class_level=True)
+                if not add_module(rel):
+                    handle_missing_file(rel)
+            elif rel.endswith(".py") and rel.startswith("tests/"):
+                add_test_file(rel)
             continue
 
-        if rel in fixtures:
-            chosen.update(fixtures[rel])
-            continue
-
-        if rel.startswith(("tests/fixtures/", "tests/data/")):
-            low = rel.lower()
-            matched = False
-            for tfile, tnums in file_to_tests.items():
-                tf = tfile.lower()
-                if (
-                    ("optimizer" in low and "optimizer" in tf)
-                    or ("parser" in low and "parser" in tf)
-                    or ("executor" in low and "executor" in tf)
-                    or ("generator" in low and "generator" in tf)
-                ):
-                    chosen.update(tnums)
-                    matched = True
-            if not matched:
+        if rel.startswith(FIXTURE_ROOT) or rel.startswith("tests/data/"):
+            if not handle_fixture(rel):
                 fallback_core()
             continue
 
@@ -677,26 +748,27 @@ def select_tests(
 
         if rel in line_runs or rel in scope_groups or rel in module_groups:
             if not f.changes:
-                # Mode-only / empty hunk: nothing observable changed. The
-                # global guard at the end still guarantees a non-empty answer.
                 continue
             if f.trivial_only:
                 handle_comments(rel, f)
-                continue
-            for ch in f.changes:
-                span = _span_index(scope_groups.get(rel, []), ch.pos)
-                if span is None or SIG_RE.match(ch.text) or IMPORT_RE.match(ch.text) or DECORATOR_RE.match(ch.text):
-                    class_level = True
-                handle_position(rel, ch.pos, ch.text)
-            if rel.startswith(DIALECT_DIR):
-                add_dialect_shared(rel, class_level)
+            else:
+                class_level = False
+                for ch in f.changes:
+                    span = _span_index(scope_groups.get(rel, []), ch.pos)
+                    if span is None or SIG_RE.match(ch.text) or IMPORT_RE.match(ch.text) \
+                            or DECORATOR_RE.match(ch.text):
+                        class_level = True
+                    handle_position(rel, ch.pos, ch.text)
+                if is_dialect_module(rel) and class_level:
+                    add_dialect_shared(rel, True)
             continue
 
         if rel.endswith(".py") and rel.startswith("sqlglot/"):
             handle_missing_file(rel)
             continue
 
-        if not rel.endswith(".py"):
+        if rel in {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini"}:
+            fallback_core()
             continue
 
     if use_all:
@@ -708,8 +780,8 @@ def select_tests(
     result = [(tid, map_ms(tid)) for tid in sorted(chosen)]
 
     if not result:
-        # Equivalent-only edits, mode changes and unknown/new test files: a
-        # single smoke test keeps the answer non-empty without inflating cost.
+        if files and core_tests:
+            return [(tid, map_ms(tid)) for tid in sorted(core_tests - memory_tids)]
         if smoke[0]:
             result = [smoke]
         else:
@@ -729,26 +801,33 @@ def _pack(items: list[tuple[int, int]], k: int) -> tuple[int, list[list[int]]]:
         loads[idx] += ms
         bins[idx].append((tid, ms))
 
-    for _ in range(400):
+    # Local search on the heaviest/lightest bins only: optimal packs almost
+    # always involve those, and n^2 scans over all bins dominate CPU.
+    for _ in range(40):
         order = sorted(range(k), key=loads.__getitem__, reverse=True)
         improved = False
-        for hi in order:
-            for lo in order:
-                if hi == lo:
+        for hi in order[:4]:
+            for lo in reversed(order[-4:]):
+                if hi == lo or loads[hi] <= loads[lo]:
                     continue
+                gap = loads[hi] - loads[lo]
                 best_gain = 0
                 best_move = None
-                for a in range(len(bins[hi])):
-                    ms_a = bins[hi][a][1]
-                    new_max = max(loads[hi] - ms_a, loads[lo] + ms_a)
-                    gain = loads[hi] - new_max
-                    if gain > best_gain:
-                        best_gain = gain
-                        best_move = (a, None)
-                for a in range(len(bins[hi])):
-                    for b in range(len(bins[lo])):
-                        ms_a = bins[hi][a][1]
-                        ms_b = bins[lo][b][1]
+                heavy = sorted(bins[hi], key=lambda x: x[1], reverse=True)[:16]
+                light = sorted(bins[lo], key=lambda x: x[1])[:16]
+                for a in range(len(heavy)):
+                    ms_a = heavy[a][1]
+                    if 0 < ms_a < gap:
+                        gain = min(ms_a, gap - ms_a)
+                        if gain > best_gain:
+                            best_gain = gain
+                            best_move = (a, None)
+                for a in range(len(heavy)):
+                    for b in range(len(light)):
+                        ms_a = heavy[a][1]
+                        ms_b = light[b][1]
+                        if ms_a <= ms_b:
+                            continue
                         new_max = max(loads[hi] - ms_a + ms_b, loads[lo] - ms_b + ms_a)
                         gain = loads[hi] - new_max
                         if gain > best_gain:
@@ -758,17 +837,16 @@ def _pack(items: list[tuple[int, int]], k: int) -> tuple[int, list[list[int]]]:
                     continue
                 a, b = best_move
                 if b is None:
-                    item = bins[hi].pop(a)
+                    item = bins[hi].pop(bins[hi].index(heavy[a]))
                     bins[lo].append(item)
                     loads[hi] -= item[1]
                     loads[lo] += item[1]
                 else:
-                    ia = bins[hi][a]
-                    ib = bins[lo][b]
-                    bins[hi][a] = ib
-                    bins[lo][b] = ia
-                    loads[hi] += ib[1] - ia[1]
-                    loads[lo] += ia[1] - ib[1]
+                    ia = bins[hi].index(heavy[a])
+                    ib = bins[lo].index(light[b])
+                    bins[hi][ia], bins[lo][ib] = light[b], heavy[a]
+                    loads[hi] += light[b][1] - heavy[a][1]
+                    loads[lo] += heavy[a][1] - light[b][1]
                 improved = True
         if not improved:
             break
@@ -781,6 +859,8 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
     if not selected:
         return []
     ordered = sorted(selected, key=lambda x: (-x[1], x[0]))
+    if sum(ms for _, ms in ordered) <= SMALL_SET_MS:
+        return [[tid for tid, _ in ordered]]
     limit = min(max_workers, len(ordered))
     ms_by_id = dict(ordered)
     best_cost = 1 << 62
@@ -821,6 +901,8 @@ def resolve_map(cli: Path | None) -> Path:
     if cli is not None:
         return cli
     for cand in (
+        Path("/app/coverage_map.pkl.gz"),
+        Path("coverage_map.pkl.gz"),
         Path("/app/coverage_map.json.gz"),
         Path("coverage_map.json.gz"),
     ):
