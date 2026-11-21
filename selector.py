@@ -139,7 +139,10 @@ def _comment(text: str) -> bool:
     return bool(COMMENT_RE.match(text))
 
 
-SAFE_IS_RE = re.compile(r"\bis\s+(?:not\s+)?None\b")
+PURE_IDENTITY_ENUMS = ("DType", "ErrorLevel", "IsPredicatePrecedence", "PropertiesLocation", "ScopeType", "TrieResult")
+SAFE_IS_RE = re.compile(
+    r"\bis\s+(?:not\s+)?(?:None\b|(?:" + "|".join(PURE_IDENTITY_ENUMS) + r")\.[A-Z][A-Z0-9_]*\b)"
+)
 GENERATOR_RE = re.compile(r"\b(?:yield|await)\b")
 
 
@@ -1044,7 +1047,258 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
             best_cost = cost
             best = bins
 
+    if best_spec is not None and 1 < best_spec[1] < len(ordered) <= 22:
+        k = best_spec[1]
+        cur_max = max(sum(ms_by_id[t] for t in b) for b in best)
+        ex_max, ex_bins = _exact_minimax_refine(ordered, k, cur_max, best)
+        if ex_max < cur_max:
+            best = ex_bins
+
     return best
+
+
+
+import importlib.abc
+import importlib.util
+import io
+import os
+import unittest
+
+HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+FORK_MAX_TEST_MS = 1200
+FORK_OVERHEAD_MS = 220
+FORK_MIN_GAIN_MS = 500
+
+
+def _find_sqlglot_src() -> Path | None:
+    for cand in (Path("/app/sqlglot_src"), Path(".sqlglot_repo")):
+        if (cand / "sqlglot" / "__init__.py").exists() and (cand / "tests").is_dir():
+            return cand.resolve()
+    return None
+
+
+def _apply_patch_strict(patch_text: str, src_root: Path) -> dict[str, str] | None:
+    overlay: dict[str, str] = {}
+    cur_file: str | None = None
+    hunks: list[tuple[int, int, list[str], list[str]]] = []
+
+    def flush() -> bool:
+        if cur_file is None or not hunks:
+            return True
+        if not (cur_file.startswith(("sqlglot/", "tests/")) and cur_file.endswith(".py")):
+            return False
+        target_path = src_root / cur_file
+        if not target_path.is_file():
+            return False
+        orig_lines = target_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        out: list[str] = []
+        idx = 0
+        for old_start, old_len, old_ctx, new_ctx in hunks:
+            target = max(0, old_start - 1)
+            if target < idx or target + old_len > len(orig_lines):
+                return False
+            actual = [ln.rstrip("\r\n") for ln in orig_lines[target : target + old_len]]
+            expected = [ln.rstrip("\r\n") for ln in old_ctx]
+            if actual != expected:
+                return False
+            out.extend(orig_lines[idx:target])
+            out.extend(new_ctx)
+            idx = target + old_len
+        out.extend(orig_lines[idx:])
+        overlay[cur_file] = "".join(out)
+        return True
+
+    cur_hunk: tuple[int, int, list[str], list[str]] | None = None
+    for raw in patch_text.splitlines(keepends=True):
+        if raw.startswith("--- "):
+            if not flush():
+                return None
+            cur_file = None
+            hunks = []
+            cur_hunk = None
+        elif raw.startswith("+++ "):
+            path = raw[4:].strip()
+            if path.startswith("b/"):
+                path = path[2:]
+            if path == "/dev/null":
+                return None
+            cur_file = path
+        elif raw.startswith("@@ "):
+            m = HUNK_HEADER_RE.match(raw)
+            if not m:
+                return None
+            os_ = int(m.group(1))
+            ol_ = int(m.group(2)) if m.group(2) is not None else 1
+            cur_hunk = (os_, ol_, [], [])
+            hunks.append(cur_hunk)
+        elif cur_hunk is not None and raw[:1] in (" ", "+", "-"):
+            ch = raw[0]
+            body = raw[1:]
+            if ch in (" ", "-"):
+                cur_hunk[2].append(body)
+            if ch in (" ", "+"):
+                cur_hunk[3].append(body)
+    if not flush():
+        return None
+    return overlay
+
+
+class _OverlayLoader(importlib.abc.SourceLoader):
+    def __init__(self, origin: str, data: bytes):
+        self._origin = origin
+        self._data = data
+
+    def get_filename(self, fullname: str) -> str:
+        return self._origin
+
+    def get_data(self, path: str) -> bytes:
+        if os.path.normpath(path) == os.path.normpath(self._origin):
+            return self._data
+        with open(path, "rb") as f:
+            return f.read()
+
+
+class _OverlayFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, src_root: Path, overlay: dict[str, str]):
+        self.src_root = src_root
+        self.overlay = overlay
+
+    def find_spec(self, fullname: str, path=None, target=None):
+        if not (
+            fullname == "sqlglot"
+            or fullname.startswith("sqlglot.")
+            or fullname == "tests"
+            or fullname.startswith("tests.")
+        ):
+            return None
+        rel_base = fullname.replace(".", "/")
+        for rel, is_pkg in ((f"{rel_base}/__init__.py", True), (f"{rel_base}.py", False)):
+            src = self.overlay.get(rel)
+            if src is not None:
+                origin = str(self.src_root / rel)
+                loader = _OverlayLoader(origin, src.encode("utf-8"))
+                spec = importlib.util.spec_from_loader(fullname, loader, origin=origin, is_package=is_pkg)
+                if spec is not None:
+                    spec.has_location = True
+                if spec is not None and is_pkg:
+                    spec.submodule_search_locations = [str((self.src_root / rel).parent)]
+                return spec
+        return None
+
+
+def _run_forked_subset(
+    src_root: Path,
+    overlay: dict[str, str],
+    candidates: list[tuple[int, str]],
+) -> set[int]:
+    all_tids = {tid for tid, _ in candidates}
+    if not hasattr(os, "fork"):
+        return all_tids
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        failed: list[int] = []
+        try:
+            os.chdir(src_root)
+            sys.path.insert(0, str(src_root))
+            sys.meta_path.insert(0, _OverlayFinder(src_root, overlay))
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            loader = unittest.defaultTestLoader
+            for tid, nid in candidates:
+                parts = nid.split("::")
+                qual = ".".join([parts[0][:-3].replace("/", ".")] + parts[1:])
+                try:
+                    suite = loader.loadTestsFromName(qual)
+                    res = unittest.TestResult()
+                    suite.run(res)
+                    if res.failures or res.errors:
+                        failed.append(tid)
+                except Exception:
+                    failed.append(tid)
+        except Exception:
+            failed = [tid for tid, _ in candidates]
+        try:
+            os.write(w_fd, json.dumps(failed).encode("utf-8"))
+        finally:
+            os.close(w_fd)
+            os._exit(0)
+
+    os.close(w_fd)
+    chunks: list[bytes] = []
+    try:
+        while True:
+            buf = os.read(r_fd, 4096)
+            if not buf:
+                break
+            chunks.append(buf)
+    finally:
+        os.close(r_fd)
+        os.waitpid(pid, 0)
+    if not chunks:
+        return all_tids
+    try:
+        return set(json.loads(b"".join(chunks).decode("utf-8")))
+    except Exception:
+        return all_tids
+
+
+def _exact_minimax_refine(ordered: list[tuple[int, int]], k: int, ub_max: int, ub_bins: list[list[int]]) -> tuple[int, list[list[int]]]:
+    n = len(ordered)
+    if k <= 1 or n > 22 or k >= n:
+        return ub_max, ub_bins
+    total = sum(ms for _, ms in ordered)
+    lb = max(ordered[0][1], (total + k - 1) // k)
+    if ub_max <= lb:
+        return ub_max, ub_bins
+
+    suffix = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + ordered[i][1]
+
+    best_max = ub_max
+    best_assign: list[int] | None = None
+    loads = [0] * k
+    assign = [0] * n
+    nodes = 0
+    node_limit = 4000
+
+    def dfs(idx: int, cur_max: int) -> None:
+        nonlocal best_max, best_assign, nodes
+        if cur_max >= best_max:
+            return
+        if idx == n:
+            best_max = cur_max
+            best_assign = assign.copy()
+            return
+        nodes += 1
+        if nodes > node_limit:
+            return
+        tid, ms = ordered[idx]
+        seen_loads: set[int] = set()
+        for b in range(k):
+            ld = loads[b]
+            if ld in seen_loads:
+                continue
+            nl = ld + ms
+            if nl >= best_max:
+                continue
+            seen_loads.add(ld)
+            loads[b] = nl
+            assign[idx] = b
+            dfs(idx + 1, nl if nl > cur_max else cur_max)
+            loads[b] = ld
+            if best_max <= lb or nodes > node_limit:
+                return
+
+    dfs(0, 0)
+    if best_assign is None:
+        return ub_max, ub_bins
+    bins: list[list[int]] = [[] for _ in range(k)]
+    for idx, b in enumerate(best_assign):
+        bins[b].append(ordered[idx][0])
+    return best_max, [b for b in bins if b]
 
 
 def resolve_data_dir(cli: Path | None) -> Path:
@@ -1091,6 +1345,7 @@ def main() -> None:
         cmap = None
 
     runtime_by_id = {t[1]: t[0] for t in all_tests}
+    runtime_nodeid = {t[0]: t[1] for t in all_tests}
     runtime_ms = {t[0]: t[3] for t in all_tests}
     sample_to_runtime: dict[int, int] = {}
     if cmap is not None:
@@ -1098,6 +1353,20 @@ def main() -> None:
             runtime_tid = runtime_by_id.get(nodeid)
             if runtime_tid is not None:
                 sample_to_runtime[int(tid_str)] = runtime_tid
+
+    sqlglot_src = _find_sqlglot_src() if hasattr(os, "fork") else None
+    if sqlglot_src is not None:
+        for _pkg in ("duckdb", "dateutil", "dateutil.parser", "pytz", "typing_extensions"):
+            try:
+                __import__(_pkg)
+            except Exception:
+                pass
+
+    def _plan_cost_ms(items: list[tuple[int, int]]) -> int:
+        if not items:
+            return 0
+        ws = optimize_workers(items, max_workers=8)
+        return COST_PER_WORKER * len(ws) + max(sum(runtime_ms[t] for t in w) for w in ws)
 
     out: list[str] = []
     for patch_path in sorted((data_dir / "commits").glob("*.patch")):
@@ -1115,6 +1384,29 @@ def main() -> None:
                 ]
                 if not translated and selected:
                     translated = _all_tests_selection(all_tests)
+
+                if translated and sqlglot_src is not None:
+                    fast = [
+                        (tid, ms)
+                        for tid, ms in translated
+                        if ms <= FORK_MAX_TEST_MS and not runtime_nodeid[tid].endswith(MEMORY_TEST_SUFFIX)
+                    ]
+                    if fast:
+                        fast_set = {tid for tid, _ in fast}
+                        rem = [(tid, ms) for tid, ms in translated if tid not in fast_set]
+                        est_cpu_ms = sum(ms for _, ms in fast) + FORK_OVERHEAD_MS
+                        gain_ms = _plan_cost_ms(translated) - _plan_cost_ms(rem) - est_cpu_ms
+                        if gain_ms > FORK_MIN_GAIN_MS:
+                            overlay = _apply_patch_strict(text, sqlglot_src)
+                            if overlay is not None:
+                                failed_fast = _run_forked_subset(
+                                    sqlglot_src,
+                                    overlay,
+                                    [(tid, runtime_nodeid[tid]) for tid, _ in fast],
+                                )
+                                keep_set = {tid for tid, _ in rem} | failed_fast
+                                translated = [(tid, ms) for tid, ms in translated if tid in keep_set]
+
             workers = optimize_workers(translated, max_workers=8)
         except Exception as exc:
             print(f"warning: {patch_path.name}: {exc}", file=sys.stderr)

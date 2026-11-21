@@ -1,4 +1,5 @@
 *
 !selector.py
 !coverage_map.pkl.gz
+!sqlglot_src.tar.gz
 !Dockerfile
