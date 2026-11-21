@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.trace_cache/
+.sqlglot_repo/
+sample/
+*.jsonl
+*_tmp_*.py
+diag.py
+check.py
+analyze_*.py
+_exp/
+.idea/
+.coverage
+coverage_map_v2.json.gz
+coverage_map_v3.json.gz
