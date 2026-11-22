@@ -49,6 +49,15 @@ HEAVY_TEST_MS = 5000
 FAST_EXECUTOR_MS = 1000
 PACK_RESTARTS = 25
 PACK_SEED = 42
+# Exact bin packing becomes exponentially expensive around 20-32 tests.
+# Keep exact search for small selections; use deterministic multi-start LPT
+# for larger ones to bound selector CPU time.
+EXACT_PARTITION_LIMIT = 18
+
+# Dynamic filtering limits.
+DYNAMIC_FILTER_MAX_TESTS = 64
+DYNAMIC_FILTER_MAX_ESTIMATED_MS = 4000
+DYNAMIC_FILTER_MIN_NET_MS = 1000
 
 DIALECT_PREFIXES = (
     "sqlglot/dialects/",
@@ -368,7 +377,17 @@ def select_tests(
     sample_ids = prep["sample_ids"]
     memory_tids = prep["memory_tids"]
     serialization_prefixes = prep["serialization_prefixes"]
-    all_ms = {tid: ms for tid, _, _, ms in all_tests}
+    # Coverage-map test IDs are from the pinned baseline. Resolve durations
+    # through node IDs so inserted/reordered tests.json numbers cannot corrupt
+    # cost estimates or the fast-executor heuristic.
+    runtime_ms_by_nodeid = {
+        nodeid.replace("\\", "/"): ms
+        for _, nodeid, _, ms in all_tests
+    }
+    all_ms = {
+        int(tid): runtime_ms_by_nodeid.get(str(nodeid).replace("\\", "/"), 0)
+        for tid, nodeid in prep["nodeids"].items()
+    }
     tid_file = {int(tid): nodeid.split("::")[0] for tid, nodeid in prep["nodeids"].items()}
     fast_executor = {
         tid for tid in sorted(
@@ -417,12 +436,10 @@ def select_tests(
         return out
 
     def safe_all_selected() -> list[tuple[int, int]]:
+        # The contest rules do not exempt memory tests from failure detection.
         if sample_ids:
-            return [(tid, map_ms(tid)) for tid in sorted(sample_ids - memory_tids)]
-        return [
-            (tid, ms) for tid, nodeid, _, ms in all_tests
-            if not nodeid.endswith(MEMORY_TEST_SUFFIX)
-        ]
+            return [(tid, map_ms(tid)) for tid in sorted(sample_ids)]
+        return [(tid, ms) for tid, _, _, ms in all_tests]
 
     def add_ids(ids) -> bool:
         before = len(chosen)
@@ -1036,7 +1053,7 @@ def optimize_workers(selected: list[tuple[int, int]], max_workers: int = 8) -> l
     best_cost = 1 << 62
     best: list[list[int]] = []
     for k in range(1, limit + 1):
-        if len(ordered) <= 32:
+        if len(ordered) <= EXACT_PARTITION_LIMIT:
             largest, bins = _exact_partition(ordered, k)
         elif k == 1:
             largest, bins = sum(ms for _, ms in ordered), [[tid for tid, _ in ordered]]
@@ -1062,6 +1079,56 @@ def _resolve_sqlglot_src() -> Path | None:
         if str(cand) and (cand / "sqlglot" / "__init__.py").is_file():
             return cand.resolve()
     return None
+
+
+def _seed_overlay_tree(src_root: Path, overlay: Path) -> None:
+    """Make overlay a complete importable view of sqlglot and tests.
+
+    Changed files are already materialized as regular files in ``overlay``.
+    Every unchanged file becomes a symlink to the pinned checkout. Directory
+    nodes are real directories, not directory symlinks, so a changed child
+    module can shadow its original without writing into the source checkout.
+    """
+    for tree_name in ("sqlglot", "tests"):
+        source_root = src_root / tree_name
+        if not source_root.is_dir():
+            continue
+
+        for current, dirnames, filenames in os.walk(source_root):
+            dirnames[:] = [
+                name for name in dirnames
+                if name not in {"__pycache__", ".pytest_cache"}
+            ]
+            current_path = Path(current)
+            relative_dir = current_path.relative_to(src_root)
+            target_dir = overlay / relative_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            for filename in filenames:
+                if filename.endswith((".pyc", ".pyo")):
+                    continue
+                source_file = current_path / filename
+                target_file = target_dir / filename
+                if target_file.exists() or target_file.is_symlink():
+                    continue
+                try:
+                    target_file.symlink_to(source_file)
+                except OSError:
+                    # Linux containers support symlinks, but retain a safe
+                    # fallback for local testing on filesystems that do not.
+                    shutil.copy2(source_file, target_file)
+
+    # pytest needs to discover the same project configuration from overlay.
+    for filename in (
+        "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "conftest.py"
+    ):
+        source_file = src_root / filename
+        target_file = overlay / filename
+        if source_file.is_file() and not target_file.exists() and not target_file.is_symlink():
+            try:
+                target_file.symlink_to(source_file)
+            except OSError:
+                shutil.copy2(source_file, target_file)
 
 
 def _apply_overlay(patch_text: str, commit_id: str, src_root: Path) -> Path | None:
@@ -1149,6 +1216,7 @@ def _apply_overlay(patch_text: str, commit_id: str, src_root: Path) -> Path | No
     if not flush():
         shutil.rmtree(overlay, ignore_errors=True)
         return None
+    _seed_overlay_tree(src_root, overlay)
     return overlay
 
 
@@ -1166,7 +1234,8 @@ def _pytest_filter_nodeids(src_root: Path, overlay: Path, nodeids: list[str]) ->
             if devnull > 2:
                 os.close(devnull)
 
-            os.chdir(src_root)
+            # Run collection and tests from the overlay, not the pristine checkout.
+            os.chdir(overlay)
             sys.path[:] = [str(overlay), str(src_root)] + [p for p in sys.path if p not in (str(overlay), str(src_root))]
             os.environ["PYTHONPATH"] = str(overlay) + os.pathsep + str(src_root)
             os.environ["SKIP_INTEGRATION"] = "0"
@@ -1282,7 +1351,8 @@ def resolve_map(cli: Path | None) -> Path:
 
 
 def _all_tests_selection(all_tests: list[tuple[int, str, str, int]]) -> list[tuple[int, int]]:
-    return [(tid, ms) for tid, nodeid, _, ms in all_tests if not nodeid.endswith(MEMORY_TEST_SUFFIX)]
+    # A fallback must include every numbered test, including memory tests.
+    return [(tid, ms) for tid, _, _, ms in all_tests]
 
 
 def main() -> None:
@@ -1310,10 +1380,21 @@ def main() -> None:
             if runtime_tid is not None:
                 sample_to_runtime[int(tid_str)] = runtime_tid
 
+    # Planning is used for sorting, deciding whether to run dynamic filtering,
+    # and emitting the final result. Cache the partition so the expensive
+    # worker optimizer is not run repeatedly for the same test selection.
+    worker_plan_cache: dict[tuple[tuple[int, int], ...], list[list[int]]] = {}
+
+    def _plan_workers(items: list[tuple[int, int]]) -> list[list[int]]:
+        key = tuple(items)
+        if key not in worker_plan_cache:
+            worker_plan_cache[key] = optimize_workers(items, max_workers=8)
+        return worker_plan_cache[key]
+
     def _plan_cost_ms(items: list[tuple[int, int]]) -> int:
-        if not items:
+        ws = _plan_workers(items)
+        if not ws:
             return 0
-        ws = optimize_workers(items, max_workers=8)
         return COST_PER_WORKER * len(ws) + max(sum(runtime_ms[t] for t in w) for w in ws)
 
     plans: list[tuple[Path, list[tuple[int, int]], str]] = []
@@ -1338,7 +1419,27 @@ def main() -> None:
             translated = _all_tests_selection(all_tests)
         plans.append((patch_path, translated, text))
 
-    plans.sort(key=lambda item: (-_plan_cost_ms(item[1]), item[0].name))
+    def _dynamic_filter_metrics(item):
+        """Prioritize cheap test suites with worthwhile filtering potential."""
+        patch_path, items, _ = item
+
+        if not (2 <= len(items) <= DYNAMIC_FILTER_MAX_TESTS):
+            return (1, 0, 0, patch_path.name)
+
+        estimated_cpu_ms = sum(ms for _, ms in items)
+
+        if estimated_cpu_ms > DYNAMIC_FILTER_MAX_ESTIMATED_MS:
+            return (1, 0, 0, patch_path.name)
+
+        simulated_ms = _plan_cost_ms(items)
+        net_headroom_ms = simulated_ms - estimated_cpu_ms
+
+        if net_headroom_ms < DYNAMIC_FILTER_MIN_NET_MS:
+            return (1, 0, 0, patch_path.name)
+
+        return (0, estimated_cpu_ms, -net_headroom_ms, patch_path.name)
+
+    plans.sort(key=_dynamic_filter_metrics)
 
     src_root = _resolve_sqlglot_src()
     if hasattr(os, "fork"):
@@ -1353,13 +1454,31 @@ def main() -> None:
 
     for patch_path, translated, text in plans:
         remaining = translated
+
+        estimated_cpu_ms = sum(ms for _, ms in translated)
+        simulated_ms_before_filter = _plan_cost_ms(translated)
+
+        should_filter = (
+            2 <= len(translated) <= DYNAMIC_FILTER_MAX_TESTS
+            and estimated_cpu_ms <= DYNAMIC_FILTER_MAX_ESTIMATED_MS
+            and simulated_ms_before_filter - estimated_cpu_ms
+            >= DYNAMIC_FILTER_MIN_NET_MS
+        )
+
         if (
             src_root is not None
             and text.strip()
             and cpu_used_seconds < cpu_budget_seconds
-            and _plan_cost_ms(translated) > 2200
+            and should_filter
         ):
-            overlay = _apply_overlay(text, patch_path.stem, src_root)
+            try:
+                overlay = _apply_overlay(text, patch_path.stem, src_root)
+            except Exception as exc:
+                print(
+                    f"warning: overlay disabled for {patch_path.name}: {exc}",
+                    file=sys.stderr,
+                )
+                overlay = None
             if overlay is not None:
                 try:
                     nodeids = [runtime_nodeid[tid] for tid, _ in sorted(translated, key=lambda x: (-x[1], x[0]))]
@@ -1392,7 +1511,7 @@ def main() -> None:
     out: list[str] = []
     simulated_ms = 0
     for patch_path in patch_paths:
-        workers = optimize_workers(filtered.get(patch_path.stem, []), max_workers=8)
+        workers = _plan_workers(filtered.get(patch_path.stem, []))
         occupied = [worker for worker in workers if worker]
         if occupied:
             largest = max(
@@ -1420,3 +1539,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
